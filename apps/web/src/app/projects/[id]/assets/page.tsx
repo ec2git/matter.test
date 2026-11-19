@@ -3,17 +3,18 @@ import { notFound } from "next/navigation";
 import { Shell } from "@/components/Shell";
 import { RunStatus } from "@/components/badges";
 import { RunProgress, type Progress } from "@/components/RunProgress";
-import { agentRuns, currentPlan, liveRequirements, passages, projectQuestions, projectSources, projectTracks, removedSources, sourceTitle, type AgentRun, type PlanTree, type SourceRow, type TrackRow } from "@/lib/assets";
+import { agentRuns, currentPlan, liveRequirements, passages, planHistory, planVersion, projectQuestions, projectSources, projectTracks, removedSources, sourceTitle, type AgentRun, type PlanTree, type SourceRow, type TrackRow } from "@/lib/assets";
 import { latestSiteCheck, projectWithClient } from "@/lib/queries";
 import { KIND_LABEL, REVIEW_LABEL, planCode, planKey, SOURCE_STATUS_LABEL, SOURCE_TYPE_LABEL, clock, duration, plural, timeAgo, usd } from "@/lib/format";
 import { checkConfluence, removeSource, restoreSource, retrySource, updateQuestion } from "./actions";
 import { AddSource, AgentInstructions, AttachTranscript, AutoRefresh } from "./SourceForms";
 import { DeletePlan, DraftAgain, EditPlan, NewPlanForm } from "./PlanForms";
 import { ConfirmAction } from "@/components/ConfirmAction";
+import { HistoryList, VersionView } from "./HistoryTab";
 
 export const dynamic = "force-dynamic";
 
-const TABS = ["plan", "requirements", "stories", "scenarios", "cases", "coverage", "questions"] as const;
+const TABS = ["plan", "requirements", "stories", "scenarios", "cases", "coverage", "questions", "history"] as const;
 type Tab = (typeof TABS)[number];
 
 function sourceDetail(s: SourceRow, inGroup = false): string {
@@ -127,9 +128,9 @@ function sourcesLabel(t: TrackRow, srcs: SourceRow[]): string {
   return names.length ? names.join(", ") : "Its sources were removed";
 }
 
-export default async function TestAssets({ params, searchParams }: { params: Promise<{ id: string }>; searchParams: Promise<{ tab?: string; plan?: string }> }) {
+export default async function TestAssets({ params, searchParams }: { params: Promise<{ id: string }>; searchParams: Promise<{ tab?: string; plan?: string; v?: string }> }) {
   const { id } = await params;
-  const { tab: tabParam, plan: planParam } = await searchParams;
+  const { tab: tabParam, plan: planParam, v: versionParam } = await searchParams;
   if (!UUID.test(id)) notFound();
   const row = await projectWithClient(id);
   if (!row) notFound();
@@ -141,7 +142,11 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
   if (planParam && !track) notFound();
   // Plan runs queued before plans had names belong to the project's first plan.
   const runTrack = (r: AgentRun) => r.trackId ?? tracks[0]?.id ?? null;
-  const [reqs, tree, questions] = track ? await Promise.all([liveRequirements(id, track.id), currentPlan(track.id), projectQuestions(id, track.id)]) : [[], null, []];
+  const [reqs, tree, questions, history] = track
+    ? await Promise.all([liveRequirements(id, track.id), currentPlan(track.id), projectQuestions(id, track.id), planHistory(track.id)])
+    : [[], null, [], []];
+  // History: one version opened read-only.
+  const viewVersion = track && tab === "history" && versionParam && /^\d+$/.test(versionParam) ? await planVersion(track.id, Number(versionParam)) : null;
   // The list of test plans: each one's current version and counts.
   const summaries = track
     ? []
@@ -217,6 +222,7 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
     { id: "cases", label: `Test cases · ${cases.length}` },
     { id: "coverage", label: "Coverage" },
     { id: "questions", label: `Questions · ${openQuestions.length}` },
+    { id: "history", label: `History · ${history.length}` },
   ];
   const body = tree?.plan.body;
   /** Reading a source again starts the agent, so the button asks first and says which plans it touches. */
@@ -743,6 +749,14 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
                 })}
               </div>
             ) : <div className="empty">No requirements yet.</div>
+          )}
+
+          {tab === "history" && track && (
+            viewVersion ? (
+              <VersionView tree={viewVersion} backHref={assetsHref(track, "history")} K={(k) => K(k)} KT={KT} />
+            ) : (
+              <HistoryList history={history} versionHref={(v) => `${assetsHref(track, "history")}&v=${v}`} />
+            )
           )}
 
           {tab === "questions" && (

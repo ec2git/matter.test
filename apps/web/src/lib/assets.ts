@@ -59,13 +59,84 @@ export async function currentPlan(trackId: string): Promise<PlanTree | null> {
     .where(and(eq(testPlans.trackId, trackId), ne(testPlans.status, "superseded")))
     .orderBy(desc(testPlans.version))
     .limit(1);
-  if (!plan) return null;
+  return plan ? treeOf(plan) : null;
+}
+
+async function treeOf(plan: PlanRow): Promise<PlanTree> {
   const [scen, stories] = await Promise.all([
     db.select().from(scenarios).where(eq(scenarios.planId, plan.id)).orderBy(asc(scenarios.position)),
     db.select().from(userStories).where(eq(userStories.planId, plan.id)).orderBy(asc(userStories.position)),
   ]);
   const cases = scen.length ? await db.select().from(testCases).where(inArray(testCases.scenarioId, scen.map((s) => s.id))).orderBy(asc(testCases.key)) : [];
   return { plan, stories, scenarios: scen.map((s) => ({ ...s, cases: cases.filter((c) => c.scenarioId === s.id) })) };
+}
+
+/** One version of a test plan, current or superseded, with what it still holds. */
+export async function planVersion(trackId: string, version: number): Promise<PlanTree | null> {
+  const [plan] = await db.select().from(testPlans).where(and(eq(testPlans.trackId, trackId), eq(testPlans.version, version))).limit(1);
+  return plan ? treeOf(plan) : null;
+}
+
+export type PlanVersionRow = {
+  id: string;
+  version: number;
+  status: string;
+  createdAt: Date;
+  reviewedBy: string | null;
+  reviewedAt: Date | null;
+  /** Why it was drafted: "First draft", "Draft again", "Source read", "Confluence update". */
+  reason: string;
+  requestedBy: string | null;
+  costUsd: number;
+  durationSec: number | null;
+  stories: number;
+  /** Scenario and test case titles, for the changes from the version before. */
+  scenarioTitles: string[];
+  cases: { title: string; reviewState: string }[];
+  critical: string[];
+};
+
+/** Every version of a test plan, newest first, with the run that drafted it. */
+export async function planHistory(trackId: string): Promise<PlanVersionRow[]> {
+  const plans = await db.select().from(testPlans).where(eq(testPlans.trackId, trackId)).orderBy(desc(testPlans.version));
+  if (!plans.length) return [];
+  const ids = plans.map((p) => p.id);
+  const taskIds = plans.flatMap((p) => (p.taskId ? [p.taskId] : []));
+  const [scen, stories, runRows] = await Promise.all([
+    db.select({ id: scenarios.id, planId: scenarios.planId, title: scenarios.title }).from(scenarios).where(inArray(scenarios.planId, ids)),
+    db.select({ planId: userStories.planId }).from(userStories).where(inArray(userStories.planId, ids)),
+    taskIds.length
+      ? db
+          .select({ taskId: tasks.id, params: tasks.params, cost: runs.costUsd, startedAt: runs.startedAt, finishedAt: runs.finishedAt })
+          .from(tasks)
+          .innerJoin(runs, eq(runs.taskId, tasks.id))
+          .where(inArray(tasks.id, taskIds))
+      : Promise.resolve([]),
+  ]);
+  const cases = scen.length ? await db.select({ scenarioId: testCases.scenarioId, title: testCases.title, reviewState: testCases.reviewState }).from(testCases).where(inArray(testCases.scenarioId, scen.map((s) => s.id))) : [];
+  return plans.map((p) => {
+    const run = runRows.find((r) => r.taskId === p.taskId);
+    const params = (run?.params ?? {}) as { newPlan?: boolean; confluence?: boolean; sourceId?: string; requestedBy?: string };
+    // Plan runs queued after a source read or a Confluence check carry what triggered them; the rest come from Draft again.
+    const reason = params.newPlan ? "First draft" : params.confluence ? "Confluence update" : params.sourceId ? "Source read" : run ? "Draft again" : "Draft";
+    const mine = scen.filter((s) => s.planId === p.id);
+    return {
+      id: p.id,
+      version: p.version,
+      status: p.status,
+      createdAt: p.createdAt,
+      reviewedBy: p.reviewedBy,
+      reviewedAt: p.reviewedAt,
+      reason,
+      requestedBy: params.requestedBy ?? null,
+      costUsd: Number(run?.cost ?? 0),
+      durationSec: run?.startedAt && run.finishedAt ? Math.round((run.finishedAt.getTime() - run.startedAt.getTime()) / 1000) : null,
+      stories: stories.filter((s) => s.planId === p.id).length,
+      scenarioTitles: mine.map((s) => s.title),
+      cases: cases.filter((c) => mine.some((s) => s.id === c.scenarioId)).map((c) => ({ title: c.title, reviewState: c.reviewState })),
+      critical: p.body?.critical?.map((c) => c.key) ?? [],
+    };
+  });
 }
 
 export async function projectQuestions(projectId: string, trackId?: string): Promise<QuestionRow[]> {
