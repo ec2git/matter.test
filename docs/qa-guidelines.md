@@ -26,6 +26,10 @@ Everything below is a starting point: change, add or delete freely. Lines inside
 - Expected results are what the tester can see: exact messages, totals and states when the source gives them.
 - Preconditions say what must be set up first (account, cart contents, settings in the CMS).
 - Don't repeat the same check across cases; reference the other case instead.
+- 3rd party integrations if mentioned or available.
+- Have cases for guest and logged in user flow if applicable.
+- Include URL of the page being tested or verified.
+- Include Figma design URL when including design verification.
 
 ## Test data
 
@@ -38,6 +42,8 @@ Everything below is a starting point: change, add or delete freely. Lines inside
 
 - **Accessibility:** WCAG 2.2 AA: keyboard use, visible focus, labels, error messages announced to screen readers, colour contrast.
 - **Mobile:** the same journey on a phone-sized screen.
+- **Responsive** 320px minimum screen width, consider breakpoints.
+- **Design** Refer to figma designs available.
 - **Forms:** required fields, validation messages, what happens on success, where submissions go (email, CRM).
 - **Analytics and consent:** key events fire (e.g. GA4 purchase, lead), and the cookie banner is honoured.
 - **SEO basics** on new or changed pages: title, meta description, one H1, no accidental noindex.
@@ -46,7 +52,7 @@ Raise a question rather than inventing a requirement when one of these matters b
 
 ## Leave out unless a source asks for it
 
-- Third-party systems' own internals (payment gateways, ERPs, CRMs): test up to the hand-off.
+<!--- - Third-party systems' own internals (payment gateways, ERPs, CRMs): test up to the hand-off.-->
 - Load and performance testing beyond a page feeling fast.
 - Browser versions older than the current and previous major release.
 
