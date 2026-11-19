@@ -2,24 +2,26 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { Shell } from "@/components/Shell";
 import { RunStatus } from "@/components/badges";
-import { agentRuns, currentPlan, liveRequirements, passages, projectQuestions, projectSources, sourceTitle, type AgentRun, type SourceRow } from "@/lib/assets";
+import { RunProgress, type Progress } from "@/components/RunProgress";
+import { agentRuns, currentPlan, liveRequirements, passages, projectQuestions, projectSources, projectTracks, removedSources, sourceTitle, type AgentRun, type PlanTree, type SourceRow, type TrackRow } from "@/lib/assets";
 import { latestSiteCheck, projectWithClient } from "@/lib/queries";
-import { KIND_LABEL, REVIEW_LABEL, SOURCE_STATUS_LABEL, SOURCE_TYPE_LABEL, clock, duration, plural, timeAgo, usd } from "@/lib/format";
-import { checkConfluence, regeneratePlan, retrySource, updateQuestion } from "./actions";
+import { KIND_LABEL, REVIEW_LABEL, planCode, planKey, SOURCE_STATUS_LABEL, SOURCE_TYPE_LABEL, clock, duration, plural, timeAgo, usd } from "@/lib/format";
+import { checkConfluence, regeneratePlan, removeSource, restoreSource, retrySource, updateQuestion } from "./actions";
 import { AddSource, AgentInstructions, AttachTranscript, AutoRefresh } from "./SourceForms";
+import { DeletePlan, EditPlan, NewPlanForm } from "./PlanForms";
 
 export const dynamic = "force-dynamic";
 
 const TABS = ["plan", "requirements", "stories", "scenarios", "cases", "coverage", "questions"] as const;
 type Tab = (typeof TABS)[number];
 
-function sourceDetail(s: SourceRow): string {
+function sourceDetail(s: SourceRow, inGroup = false): string {
   const m = s.meta;
   return [
-    SOURCE_TYPE_LABEL[s.type] ?? s.type,
+    inGroup ? null : (SOURCE_TYPE_LABEL[s.type] ?? s.type),
     s.version > 1 ? `version ${s.version}` : null,
-    m.confluence && m.confluence.pageId !== m.confluence.rootPageId ? "child page" : null,
-    m.confluence?.includeChildren ? "with child pages" : null,
+    inGroup ? null : m.confluence?.rootKind === "folder" ? "from a folder" : m.confluence && m.confluence.pageId !== m.confluence.rootPageId ? "child page" : null,
+    inGroup ? null : m.confluence?.includeChildren ? "with child pages" : null,
     m.pages ? plural(m.pages, "page") : null,
     m.durationSec ? clock(m.durationSec) : null,
     m.owner ? `by ${m.owner}` : null,
@@ -28,6 +30,71 @@ function sourceDetail(s: SourceRow): string {
   ]
     .filter(Boolean)
     .join(" · ");
+}
+
+/** Confluence pages added together (a folder, or a page with its child pages), shown as one collapsible group. */
+type SourceGroup = { key: string; title: string; kind: "folder" | "page"; href: string | null; members: SourceRow[] };
+
+/** The sources list: single sources as they are, and pages read through a folder or parent page grouped under it. */
+function groupSources(srcs: SourceRow[]): ({ kind: "one"; source: SourceRow } | { kind: "group"; group: SourceGroup })[] {
+  const out: ({ kind: "one"; source: SourceRow } | { kind: "group"; group: SourceGroup })[] = [];
+  const groups = new Map<string, SourceGroup>();
+  for (const s of srcs) {
+    const c = s.meta.confluence;
+    const grouped = c && (c.rootKind === "folder" || c.includeChildren || c.pageId !== c.rootPageId);
+    if (!c || !grouped) {
+      out.push({ kind: "one", source: s });
+      continue;
+    }
+    let g = groups.get(c.rootPageId);
+    if (!g) {
+      g = { key: c.rootPageId, title: c.rootTitle ?? "", kind: c.rootKind === "folder" ? "folder" : "page", href: null, members: [] };
+      groups.set(c.rootPageId, g);
+      out.push({ kind: "group", group: g });
+    }
+    g.members.push(s);
+  }
+  for (const g of groups.values()) {
+    const root = g.members.find((m) => m.meta.confluence?.pageId === g.key);
+    const any = g.members.find((m) => m.meta.confluence?.webUrl)?.meta.confluence?.webUrl;
+    g.title ||= root ? sourceTitle(root) : g.kind === "folder" ? "Confluence folder" : "Confluence page";
+    g.href = g.kind === "page" ? (root?.meta.confluence?.webUrl ?? root?.uri ?? null) : any ? any.replace(/\/pages\/\d+.*$/, `/folder/${g.key}`) : null;
+    // The page that was added first, then its child pages by title.
+    g.members.sort((a, b) => Number(b.meta.confluence?.pageId === g.key) - Number(a.meta.confluence?.pageId === g.key) || sourceTitle(a).localeCompare(sourceTitle(b)));
+  }
+  return out;
+}
+
+/** One group of Confluence pages: a summary line that opens to the pages. Open by default when a page needs attention. */
+function SourceGroupView({ group, render }: { group: SourceGroup; render: (s: SourceRow) => React.ReactNode }) {
+  const n = (st: string) => group.members.filter((m) => m.status === st).length;
+  const attention = n("failed") + n("needs-transcript");
+  const working = n("queued") + n("ingesting");
+  const notes = [...new Set(group.members.map((m) => m.meta.note).filter(Boolean))];
+  const state = [
+    n("ready") === group.members.length ? "all read" : n("ready") ? `${n("ready")} read` : null,
+    working ? `${working} reading` : null,
+    n("failed") ? `${n("failed")} failed` : null,
+    n("needs-transcript") ? `${n("needs-transcript")} need a transcript` : null,
+  ].filter(Boolean);
+  return (
+    <details className="source-group" open={attention > 0 || undefined}>
+      <summary className="source-group-head">
+        <span className="stack" style={{ gap: 2, minWidth: 0 }}>
+          <span className="source-name">{group.title}</span>
+          <span className="small muted">
+            Confluence {group.kind === "folder" ? "folder" : "page with child pages"} · {plural(group.members.length, "page")} · {state.join(", ")}
+          </span>
+        </span>
+        <span className={`pill status-${attention ? "failed" : working ? "ingesting" : "ready"}`}>{attention ? "Needs attention" : working ? "Reading" : "Ingested"}</span>
+      </summary>
+      <div className="source-group-body">
+        {group.href && <a className="small" href={group.href} target="_blank" rel="noreferrer">Open {group.kind === "folder" ? "folder" : "page"} in Confluence</a>}
+        {notes.map((note) => <span key={note} className="small source-note">Note for the agent: {note}</span>)}
+        {group.members.map((m) => render(m))}
+      </div>
+    </details>
+  );
 }
 
 /** The last Confluence add or update check: what it found, or why it failed. */
@@ -50,27 +117,70 @@ function ConfluenceStatus({ run }: { run: AgentRun }) {
   );
 }
 
-export default async function TestAssets({ params, searchParams }: { params: Promise<{ id: string }>; searchParams: Promise<{ tab?: string }> }) {
+const UUID = /^[0-9a-f-]{36}$/i;
+
+/** Which sources a test plan reads, in words. */
+function sourcesLabel(t: TrackRow, srcs: SourceRow[]): string {
+  if (!t.sourceIds) return "All sources";
+  const names = t.sourceIds.map((sid) => srcs.find((x) => x.id === sid)).filter(Boolean).map((x) => sourceTitle(x!));
+  return names.length ? names.join(", ") : "Its sources were removed";
+}
+
+export default async function TestAssets({ params, searchParams }: { params: Promise<{ id: string }>; searchParams: Promise<{ tab?: string; plan?: string }> }) {
   const { id } = await params;
-  const { tab: tabParam } = await searchParams;
-  if (!/^[0-9a-f-]{36}$/i.test(id)) notFound();
+  const { tab: tabParam, plan: planParam } = await searchParams;
+  if (!UUID.test(id)) notFound();
   const row = await projectWithClient(id);
   if (!row) notFound();
   const { project, client } = row;
   const tab: Tab = (TABS as readonly string[]).includes(tabParam ?? "") ? (tabParam as Tab) : "plan";
 
-  const [srcs, reqs, tree, questions, runsList, latest] = await Promise.all([projectSources(id), liveRequirements(id), currentPlan(id), projectQuestions(id), agentRuns(id, 20), latestSiteCheck(id)]);
+  const [srcs, tracks, runsList, latest, removed] = await Promise.all([projectSources(id), projectTracks(id), agentRuns(id, 20), latestSiteCheck(id), removedSources(id)]);
+  const track = planParam && UUID.test(planParam) ? tracks.find((t) => t.id === planParam) : undefined;
+  if (planParam && !track) notFound();
+  // Plan runs queued before plans had names belong to the project's first plan.
+  const runTrack = (r: AgentRun) => r.trackId ?? tracks[0]?.id ?? null;
+  const [reqs, tree, questions] = track ? await Promise.all([liveRequirements(id, track.id), currentPlan(track.id), projectQuestions(id, track.id)]) : [[], null, []];
+  // The list of test plans: each one's current version and counts.
+  const summaries = track
+    ? []
+    : await Promise.all(
+        tracks.map(async (t) => {
+          const [tr, rq] = await Promise.all([currentPlan(t.id), liveRequirements(id, t.id)]);
+          return { track: t, tree: tr, reqs: rq.filter((r) => r.reviewState !== "rejected").length };
+        }),
+      );
   // Test cases in plan order (story by story), not key order, so the Story column reads in runs.
   const cases = tree?.scenarios.flatMap((s) => s.cases.map((c) => ({ ...c, scenario: s }))) ?? [];
   const storyById = new Map((tree?.stories ?? []).map((st) => [st.id, st]));
   const openQuestions = questions.filter((q) => q.status === "open");
   const busy = runsList.some((r) => r.status === "queued" || r.status === "running");
+  // The plan is out of date when a source it was drafted from is gone, or a ready source with requirements isn't in it.
+  const readyWithReqs = new Set(reqs.flatMap((r) => (r.sourceId ? [r.sourceId] : [])));
+  const planSources = new Set(tree?.plan.sourceIds ?? []);
+  const staleReasons = tree
+    ? [
+        ...[...planSources].filter((sid) => !srcs.some((x) => x.id === sid && x.status === "ready")).map(() => "removed"),
+        ...[...readyWithReqs].filter((sid) => !planSources.has(sid)).map(() => "added"),
+      ]
+    : [];
+  const stale = !busy && staleReasons.length > 0;
   const hasConfluence = srcs.some((s) => s.type === "confluence");
   const lastConfluence = runsList.find((r) => r.confluence);
-  const lastPlanRun = runsList.find((r) => r.kind === "plan");
+  const planRuns = runsList.filter((r) => r.kind === "plan" && (!track || runTrack(r) === track.id));
+  const lastPlanRun = planRuns[0];
+  const readySources = srcs.filter((s) => s.status === "ready").map((s) => ({ id: s.id, name: sourceTitle(s), type: SOURCE_TYPE_LABEL[s.type] ?? s.type }));
+  const assetsHref = (t: TrackRow, tabId: Tab = "plan") => `/projects/${id}/assets?plan=${t.id}${tabId === "plan" ? "" : `&tab=${tabId}`}`;
   const inFlight = runsList.filter((r) => r.status === "queued" || r.status === "running");
   const spent = runsList.reduce((n, r) => n + r.costUsd, 0);
   const liveReqs = reqs.filter((r) => r.reviewState !== "rejected");
+  /** IDs as shown in this plan: TP1-REQ-01. */
+  const K = (key: string | null | undefined) => (key ? (track ? planKey(track.number, key) : key) : "");
+  const KL = (keys: string[]) => keys.map(K).join(", ");
+  /** Opens an item in the review inbox, filtered to this test plan. */
+  const reviewHref = (kind: "req" | "story" | "scenario" | "tc", itemId: string) => `/projects/${id}/review?${track ? `plan=${track.id}&` : ""}item=${kind}:${itemId}`;
+  /** The same prefix for IDs the agent wrote inside its sentences ("REQ-17 (Focal) and REQ-25 can't both hold"). */
+  const KT = (text: string) => (track ? text.replace(/\b(?<!-)((?:REQ|US|SC|TC)-\d+)\b/g, (m) => planKey(track.number, m)) : text);
   const critical = new Set(tree?.plan.body?.critical?.map((c) => c.key) ?? []);
   const criticalWhy = new Map(tree?.plan.body?.critical?.map((c) => [c.key, c.why]) ?? []);
   const kindsFor = (key: string) => {
@@ -108,60 +218,104 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
     { id: "questions", label: `Questions · ${openQuestions.length}` },
   ];
   const body = tree?.plan.body;
+  const sourceRow = (s: SourceRow, inGroup = false) => {
+    const canRemove = s.status === "ready" || s.status === "failed" || s.status === "needs-transcript";
+    const canReread = s.status === "ready" && !!(s.fileUri || s.uri);
+    const openHref = s.type === "loom" ? s.uri : s.type === "confluence" ? (s.meta.confluence?.webUrl ?? s.uri) : null;
+    return (
+      <div key={s.id} className={`source-row${inGroup ? " source-row-sub" : ""}`}>
+        <div className="row">
+          {s.status === "ready" ? <Link className="source-name" href={`/sources/${s.id}`}>{sourceTitle(s)}</Link> : <span className="source-name">{sourceTitle(s)}</span>}
+          <span className={`pill status-${s.status}`}>{SOURCE_STATUS_LABEL[s.status] ?? s.status}</span>
+        </div>
+        {sourceDetail(s, inGroup) && <span className="small muted">{sourceDetail(s, inGroup)}</span>}
+        {s.meta.note && !inGroup && <span className="small source-note">Note for the agent: {s.meta.note}</span>}
+        {s.error && <span className="small" style={{ color: s.status === "failed" ? "var(--crit)" : "var(--high)" }}>{s.error}</span>}
+        {s.status === "needs-transcript" && (
+          <>
+            {s.type === "loom" && s.uri && (
+              <form action={retrySource}>
+                <input type="hidden" name="sourceId" value={s.id} />
+                <button type="submit" className="btn btn-outline btn-sm" disabled={busy}>Try Loom again</button>
+              </form>
+            )}
+            <AttachTranscript sourceId={s.id} />
+          </>
+        )}
+        {s.status === "failed" && (
+          <form action={retrySource}>
+            <input type="hidden" name="sourceId" value={s.id} />
+            <button type="submit" className="btn btn-outline btn-sm">Try again</button>
+          </form>
+        )}
+        {(openHref || canRemove || canReread) && (
+          <div className="source-actions small">
+            {openHref && <a href={openHref} target="_blank" rel="noreferrer">Open in {s.type === "loom" ? "Loom" : "Confluence"}</a>}
+            {canReread && (
+              <form action={retrySource}>
+                <input type="hidden" name="sourceId" value={s.id} />
+                <button type="submit" className="link-btn small" disabled={busy} title="Read this source again with the current instructions, for every test plan that uses it. Its requirements and questions are replaced, so earlier approvals on them are lost.">
+                  Read again
+                </button>
+              </form>
+            )}
+            {canRemove && (
+              <details className="remove-source">
+                <summary className="small">Remove</summary>
+                <form action={removeSource} className="stack" style={{ gap: 6, marginTop: 6 }}>
+                  <input type="hidden" name="sourceId" value={s.id} />
+                  <span className="small muted">Its requirements stop feeding the plans and its open client questions are withdrawn. Approved test cases stay. You can restore it later.</span>
+                  <button type="submit" className="btn btn-danger btn-sm" style={{ alignSelf: "flex-start" }}>Remove {sourceTitle(s)}</button>
+                </form>
+              </details>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  };
+  const sourceItems = groupSources(srcs);
+
+  const working = inFlight.length > 0 && (
+    <section className="panel working-panel" aria-label="Agent progress">
+      {[...inFlight].reverse().map((r) => (
+        <RunProgress key={r.id} title={r.title} status={r.status} progress={progressOf(r)} startedAt={r.startedAt?.toISOString() ?? null} />
+      ))}
+    </section>
+  );
+
 
   return (
     <Shell active="assets" project={{ id, name: project.name, client: client.name, platform: project.platform, latestRunId: latest?.id }}>
       <AutoRefresh active={busy} />
       <div className="page-head">
         <div>
-          <span className="crumbs"><Link href={`/projects/${id}`}>{client.name}</Link> / Test assets</span>
+          <span className="crumbs">
+            <Link href={`/projects/${id}`}>{client.name}</Link> / {track ? <><Link href={`/projects/${id}/assets`}>Test assets</Link> / {track.name}</> : "Test assets"}
+          </span>
           <div className="title-row">
-            <h1>{project.name}</h1>
-            {tree && <span className={`pill status-${tree.plan.status}`}>Plan v{tree.plan.version} · {REVIEW_LABEL[tree.plan.status] ?? tree.plan.status}</span>}
+            <h1>{track ? <><span className="muted">{planCode(track.number)} · </span>{track.name}</> : project.name}</h1>
+            {tree && <span className={`pill status-${tree.plan.status}`}>v{tree.plan.version} · {REVIEW_LABEL[tree.plan.status] ?? tree.plan.status}</span>}
           </div>
+          {track?.focus && <span className="muted small">Covers: {track.focus}</span>}
         </div>
         <div className="row">
-          <Link className="btn" href={`/projects/${id}/review`}>Review and approve</Link>
+          <Link className="btn" href={`/projects/${id}/review${track ? `?plan=${track.id}` : ""}`}>Review and approve</Link>
         </div>
       </div>
 
       <div className="assets-layout">
         <aside className="assets-side">
           <section className="panel" aria-label="Instructions for the agent">
-            <AgentInstructions projectId={id} value={project.agentInstructions ?? ""} hasPlan={!!tree} />
+            <AgentInstructions projectId={id} value={project.agentInstructions ?? ""} hasPlan={tracks.length > 0} />
           </section>
 
           <section className="panel" aria-labelledby="sources-h">
             <h2 id="sources-h" style={{ fontSize: 15 }}>Sources</h2>
             {!srcs.length && <p className="muted small" style={{ margin: 0 }}>Nothing yet. Add the client&apos;s brief, requirements document, a Confluence page or a Loom walkthrough.</p>}
-            {srcs.map((s) => (
-              <div key={s.id} className="source-row">
-                <div className="row">
-                  {s.status === "ready" ? <Link className="source-name" href={`/sources/${s.id}`}>{sourceTitle(s)}</Link> : <span className="source-name">{sourceTitle(s)}</span>}
-                  <span className={`pill status-${s.status}`}>{SOURCE_STATUS_LABEL[s.status] ?? s.status}</span>
-                </div>
-                <span className="small muted">{sourceDetail(s)}</span>
-                {s.type === "loom" && s.uri && <a className="small" href={s.uri} target="_blank" rel="noreferrer">Open in Loom</a>}
-                {s.type === "confluence" && s.uri && <a className="small" href={s.meta.confluence?.webUrl ?? s.uri} target="_blank" rel="noreferrer">Open in Confluence</a>}
-                {s.meta.note && <span className="small source-note">Note for the agent: {s.meta.note}</span>}
-                {s.error && <span className="small" style={{ color: s.status === "failed" ? "var(--crit)" : "var(--high)" }}>{s.error}</span>}
-                {s.status === "needs-transcript" && <AttachTranscript sourceId={s.id} />}
-                {s.status === "failed" && (
-                  <form action={retrySource}>
-                    <input type="hidden" name="sourceId" value={s.id} />
-                    <button type="submit" className="btn btn-outline btn-sm">Try again</button>
-                  </form>
-                )}
-                {s.status === "ready" && (s.fileUri || s.uri) && (
-                  <form action={retrySource}>
-                    <input type="hidden" name="sourceId" value={s.id} />
-                    <button type="submit" className="link-btn small" disabled={busy} title="Read this source again with the current instructions. Its requirements and questions are replaced, so earlier approvals on them are lost.">
-                      Read again
-                    </button>
-                  </form>
-                )}
-              </div>
-            ))}
+            {sourceItems.map((item) =>
+              item.kind === "one" ? sourceRow(item.source) : <SourceGroupView key={item.group.key} group={item.group} render={(x) => sourceRow(x, true)} />,
+            )}
             {(hasConfluence || lastConfluence) && (
               <div className="stack" style={{ gap: 6, paddingTop: 10, borderTop: "1px solid var(--border)" }}>
                 {lastConfluence && <ConfluenceStatus run={lastConfluence} />}
@@ -173,15 +327,32 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
                 )}
               </div>
             )}
+            {removed.length > 0 && (
+              <details className="small" style={{ paddingTop: 10, borderTop: "1px solid var(--border)" }}>
+                <summary style={{ cursor: "pointer", fontWeight: 600 }}>Removed sources · {removed.length}</summary>
+                <div className="stack" style={{ gap: 8, marginTop: 8 }}>
+                  {removed.map((s) => (
+                    <div key={s.id} className="row" style={{ justifyContent: "space-between", flexWrap: "nowrap", alignItems: "center", gap: 8 }}>
+                      <span className="stack" style={{ gap: 2, minWidth: 0 }}>
+                        <span style={{ fontWeight: 600, overflowWrap: "anywhere" }}>{sourceTitle(s)}</span>
+                        <span className="muted">{SOURCE_TYPE_LABEL[s.type] ?? s.type}{s.meta.removedBy ? ` · removed by ${s.meta.removedBy}` : ""}</span>
+                      </span>
+                      <form action={restoreSource}>
+                        <input type="hidden" name="sourceId" value={s.id} />
+                        <button type="submit" className="btn btn-outline btn-sm">Restore</button>
+                      </form>
+                    </div>
+                  ))}
+                </div>
+              </details>
+            )}
             <AddSource projectId={id} />
           </section>
 
           <section className="agent-card" aria-labelledby="gen-h">
             <div className="row" style={{ gap: 8 }}><span className="tag">AGENT</span><h2 id="gen-h" style={{ fontSize: 14 }}>Generation run</h2></div>
-            {inFlight.map((r) => (
-              <span key={r.id} className="row small" style={{ gap: 8 }}><RunStatus status={r.status} /> {r.title}</span>
-            ))}
-            {lastPlanRun && lastPlanRun.status === "done" && (
+            {inFlight.length > 0 && <span className="small muted">{plural(inFlight.length, "job")} running; progress is shown above the {track ? "plan" : "test plans"}.</span>}
+            {track && lastPlanRun && lastPlanRun.status === "done" && (
               <span className="facts-line">
                 {[
                   plural(liveReqs.length, "requirement"),
@@ -197,12 +368,21 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
             )}
             {lastPlanRun?.status === "failed" && <span className="small" style={{ color: "var(--crit)" }}>The last plan run failed: {String(lastPlanRun.summary?.error ?? "unknown error")}</span>}
             {!runsList.length && <span className="facts-line">Add a source and the agent reads it, extracts requirements and drafts a plan for you to review.</span>}
-            {reqs.length > 0 && (
+            {track && stale && (
+              <p className="banner" role="status" style={{ margin: 0 }}>
+                {reqs.length
+                  ? <>The sources have changed since this plan was drafted{staleReasons.includes("removed") ? " (a source was removed or replaced)" : ""}{staleReasons.includes("added") ? " (a source isn't in it yet)" : ""}. Draft the plan again to bring it up to date; approved stories and test cases are kept.</>
+                  : <>None of the sources this plan was drafted from are in the project any more. Add or restore a source to draft a new plan.</>}
+              </p>
+            )}
+            {track && reqs.length > 0 && (
               <form action={regeneratePlan}>
                 <input type="hidden" name="projectId" value={id} />
-                <button type="submit" className="btn btn-outline btn-sm" disabled={busy}>Draft the plan again</button>
+                <input type="hidden" name="trackId" value={track.id} />
+                <button type="submit" className="btn btn-outline btn-sm" disabled={busy}>Draft {track.name} again</button>
               </form>
             )}
+            {!track && <span className="facts-line">{plural(tracks.length, "test plan")} · {usd(spent)} spent on the agent so far</span>}
             {runsList.length > 0 && (
               <details className="small">
                 <summary style={{ cursor: "pointer", fontWeight: 600 }}>Agent runs</summary>
@@ -218,29 +398,92 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
           </section>
         </aside>
 
+        {!track ? (
+        <section className="assets-main" aria-labelledby="plans-h">
+          {working}
+          <div className="row" style={{ justifyContent: "space-between" }}>
+            <h2 id="plans-h" style={{ fontSize: 16 }}>Test plans</h2>
+            <span className="small muted">Each plan has its own topic, requirements, review and coverage. Sources are shared.</span>
+          </div>
+          {!summaries.length && (
+            <div className="empty">{srcs.length ? (busy ? "The agent is reading the sources. The first test plan appears here when it's ready." : "No test plans yet. Start one below.") : "No test plans yet. Add a source and the agent drafts the first one, or start one below once a source is ready."}</div>
+          )}
+          {summaries.map(({ track: t, tree: tr, reqs: n }) => {
+            const active = inFlight.find((r) => r.trackId === t.id);
+            const running = !!active;
+            const last = runsList.find((r) => r.kind === "plan" && runTrack(r) === t.id);
+            const caseCount = tr?.scenarios.reduce((k, x) => k + x.cases.length, 0) ?? 0;
+            return (
+              <article key={t.id} className="panel plan-card" aria-labelledby={`plan-${t.id}`}>
+                <div className="row" style={{ justifyContent: "space-between", alignItems: "flex-start" }}>
+                  <span className="stack" style={{ gap: 2, minWidth: 0 }}>
+                    <Link id={`plan-${t.id}`} className="list-title" href={assetsHref(t)} style={{ textDecoration: "none", fontSize: 16 }}><span className="muted">{planCode(t.number)} · </span>{t.name}</Link>
+                    {tr && <span className="small muted">{tr.plan.name}</span>}
+                  </span>
+                  <span className="row" style={{ gap: 6 }}>
+                    {running && <span className="row small" style={{ gap: 6 }}><RunStatus status="running" /> Working</span>}
+                    {tr ? <span className={`pill status-${tr.plan.status}`}>v{tr.plan.version} · {REVIEW_LABEL[tr.plan.status] ?? tr.plan.status}</span> : !running && <span className="pill">Not drafted</span>}
+                  </span>
+                </div>
+                <span className="small" style={{ color: "var(--ink-2)" }}>{t.focus ? <>Covers: {t.focus}</> : "Covers everything in its sources"}</span>
+                <span className="facts-line">
+                  {[plural(n, "requirement"), plural(tr?.stories.length ?? 0, "user story", "user stories"), plural(tr?.scenarios.length ?? 0, "scenario"), plural(caseCount, "test case")].join(" · ")}
+                </span>
+                <span className="small muted">Sources: {sourcesLabel(t, srcs)}</span>
+                {!running && last?.status === "failed" && <span className="small" style={{ color: "var(--crit)" }}>The last run failed: {String(last.summary?.error ?? "unknown error")}</span>}
+                <div className="row" style={{ gap: 10, alignItems: "center" }}>
+                  <Link className="btn btn-outline btn-sm" href={assetsHref(t)}>Open</Link>
+                  {n > 0 && (
+                    <form action={regeneratePlan}>
+                      <input type="hidden" name="projectId" value={id} />
+                      <input type="hidden" name="trackId" value={t.id} />
+                      <button type="submit" className="link-btn small" disabled={busy}>Draft again</button>
+                    </form>
+                  )}
+                </div>
+                <div className="row" style={{ gap: 16, alignItems: "flex-start" }}>
+                  <EditPlan trackId={t.id} name={t.name} focus={t.focus ?? ""} sourceIds={t.sourceIds} sources={readySources} busy={inFlight.length > 0} />
+                  <DeletePlan trackId={t.id} name={t.name} code={planCode(t.number)} only={tracks.length === 1} />
+                </div>
+              </article>
+            );
+          })}
+          {(srcs.length > 0 || tracks.length > 0) && <NewPlanForm projectId={id} sources={readySources} />}
+        </section>
+        ) : (
         <section className="assets-main">
+          {working}
+          <Link className="small" href={`/projects/${id}/assets`}>← All test plans</Link>
           <nav className="tabs" aria-label="Asset view">
             {tabs.map((t) => (
-              <Link key={t.id} className="tab" href={`/projects/${id}/assets${t.id === "plan" ? "" : `?tab=${t.id}`}`} aria-current={t.id === tab ? "page" : undefined}>{t.label}</Link>
+              <Link key={t.id} className="tab" href={assetsHref(track, t.id)} aria-current={t.id === tab ? "page" : undefined}>{t.label}</Link>
             ))}
           </nav>
 
           {tab === "plan" && (
             !tree ? (
-              <div className="empty">{busy ? "The agent is working on it. The plan appears here when it's ready." : "No plan yet. Add a source to get a draft."}</div>
+              <div className="empty">{busy ? "The agent is working on it. The plan appears here when it's ready." : lastPlanRun?.status === "failed" ? `The last run failed: ${String(lastPlanRun.summary?.error ?? "unknown error")}` : "Not drafted yet."}</div>
             ) : (
               <div className="panel" style={{ gap: 18 }}>
                 <div className="stack" style={{ gap: 4 }}>
-                  <h2 style={{ fontSize: 16 }}>{tree.plan.name}</h2>
-                  {body?.summary && <p style={{ margin: 0, fontSize: 14, lineHeight: 1.55 }}>{body.summary}</p>}
+                  <div className="row" style={{ gap: 8, alignItems: "center" }}>
+                    <h2 style={{ fontSize: 16 }}>{tree.plan.name}</h2>
+                    <span className={`pill status-${tree.plan.status}`}>{REVIEW_LABEL[tree.plan.status] ?? tree.plan.status}</span>
+                    {tree.plan.status === "approved" && tree.plan.reviewedAt && (
+                      <span className="small muted">
+                        {tree.plan.reviewedBy ? `by ${tree.plan.reviewedBy} ` : ""}on {new Date(tree.plan.reviewedAt).toLocaleDateString("en-AU", { day: "numeric", month: "short", year: "numeric" })}
+                      </span>
+                    )}
+                  </div>
+                  {body?.summary && <p style={{ margin: 0, fontSize: 14, lineHeight: 1.55 }}>{KT(body.summary)}</p>}
                 </div>
                 <div className="kv">
-                  <div><h3>In scope</h3><ul className="ul">{body?.scope.map((s, i) => <li key={i}>{s}</li>)}</ul></div>
-                  <div><h3>Out of scope</h3>{body?.outOfScope.length ? <ul className="ul">{body.outOfScope.map((s, i) => <li key={i}>{s}</li>)}</ul> : <span className="muted">Nothing stated</span>}</div>
+                  <div><h3>In scope</h3><ul className="ul">{body?.scope.map((s, i) => <li key={i}>{KT(s)}</li>)}</ul></div>
+                  <div><h3>Out of scope</h3>{body?.outOfScope.length ? <ul className="ul">{body.outOfScope.map((s, i) => <li key={i}>{KT(s)}</li>)}</ul> : <span className="muted">Nothing stated</span>}</div>
                 </div>
                 {!!body?.gaps?.length && (
                   <p className="banner" role="note" style={{ margin: 0 }}>
-                    Still missing after the agent&apos;s second pass: {body.gaps.map((g) => `${g.missing} scenario for ${g.key}`).join(", ")}. The sources may not say enough; add them while reviewing, or ask the client.
+                    Still missing after the agent&apos;s second pass: {body.gaps.map((g) => `${g.missing} scenario for ${K(g.key)}`).join(", ")}. The sources may not say enough; add them while reviewing, or ask the client.
                   </p>
                 )}
                 <h3>Risk-ranked areas</h3>
@@ -249,7 +492,7 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
                     <thead><tr><th>Area</th><th>Risk</th><th>Why</th><th>Priority</th></tr></thead>
                     <tbody>
                       {body?.risks.map((r, i) => (
-                        <tr key={i}><td style={{ fontWeight: 600 }}>{r.area}</td><td>{r.risk[0]!.toUpperCase() + r.risk.slice(1)}</td><td style={{ color: "var(--ink-2)" }}>{r.why}</td><td><span className="pill prio">{r.priority}</span></td></tr>
+                        <tr key={i}><td style={{ fontWeight: 600 }}>{r.area}</td><td>{r.risk[0]!.toUpperCase() + r.risk.slice(1)}</td><td style={{ color: "var(--ink-2)" }}>{KT(r.why)}</td><td><span className="pill prio">{r.priority}</span></td></tr>
                       ))}
                     </tbody>
                   </table>
@@ -258,7 +501,7 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
                   <>
                     <h3>Critical requirements</h3>
                     <p className="small muted" style={{ margin: 0 }}>Each gets a negative scenario as well as a positive one.</p>
-                    <ul className="ul">{body.critical.map((c) => <li key={c.key}><strong>{c.key}</strong> {reqTitle.get(c.key) ?? ""}: {c.why}</li>)}</ul>
+                    <ul className="ul">{body.critical.map((c) => <li key={c.key}><strong>{K(c.key)}</strong> {reqTitle.get(c.key) ?? ""}: {KT(c.why)}</li>)}</ul>
                   </>
                 )}
               </div>
@@ -273,8 +516,8 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
                   <tbody>
                     {reqs.map((r) => (
                       <tr key={r.id}>
-                        <td className="muted">{r.key}</td>
-                        <td><Link className="cell-link" href={`/projects/${id}/review?item=req:${r.id}`}>{r.title}</Link><div className="sub">{r.text}</div></td>
+                        <td className="muted nowrap">{K(r.key)}</td>
+                        <td><Link className="cell-link" href={reviewHref("req", r.id)}>{r.title}</Link><div className="sub">{r.text}</div></td>
                         <td>{r.area}</td>
                         <td><span className={`pill status-${r.reviewState}`}>{REVIEW_LABEL[r.reviewState]}</span></td>
                       </tr>
@@ -295,8 +538,8 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
                     <article key={st.id} className="panel story-card" aria-labelledby={`st-${st.id}`}>
                       <div className="row" style={{ justifyContent: "space-between", alignItems: "flex-start" }}>
                         <span className="stack" style={{ gap: 2, minWidth: 0 }}>
-                          <span className="small muted">{st.key} · covers {st.requirementIds.join(", ")}</span>
-                          <Link id={`st-${st.id}`} className="list-title" href={`/projects/${id}/review?item=story:${st.id}`} style={{ textDecoration: "none", fontSize: 16 }}>{st.title}</Link>
+                          <span className="small muted">{K(st.key)} · covers {KL(st.requirementIds)}</span>
+                          <Link id={`st-${st.id}`} className="list-title" href={reviewHref("story", st.id)} style={{ textDecoration: "none", fontSize: 16 }}>{st.title}</Link>
                         </span>
                         <span className="row" style={{ gap: 6 }}>
                           <span className="pill prio">{st.priority}</span>
@@ -308,7 +551,7 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
                         <strong>As a</strong> {st.actor}, <strong>I want to</strong> {st.want}
                         {st.soThat ? <>, <strong>so that</strong> {st.soThat}</> : null}.
                       </p>
-                      {st.critical && st.criticalWhy && <span className="small" style={{ color: "var(--ink-2)" }}>Why it&apos;s critical: {st.criticalWhy}</span>}
+                      {st.critical && st.criticalWhy && <span className="small" style={{ color: "var(--ink-2)" }}>Why it&apos;s critical: {KT(st.criticalWhy)}</span>}
                       {!!st.acceptanceCriteria.length && (
                         <div className="stack" style={{ gap: 4 }}>
                           <span className="kv-label">Acceptance criteria</span>
@@ -320,7 +563,7 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
                         {scen.map((x) => (
                           <span key={x.id} className="row small" style={{ gap: 8, flexWrap: "nowrap", alignItems: "flex-start" }}>
                             <span className={`pill kind-${x.kind}`}>{KIND_LABEL[x.kind] ?? x.kind}</span>
-                            <span>{x.key && <span className="muted">{x.key} · </span>}{x.title} · {x.priority} · {plural(x.cases.length, "case")}</span>
+                            <span><Link className="cell-link" href={reviewHref("scenario", x.id)}>{x.key && <span className="muted">{K(x.key)} · </span>}{x.title}</Link> · {x.priority} · {plural(x.cases.length, "case")}</span>
                           </span>
                         ))}
                       </div>
@@ -339,12 +582,12 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
                   .map((g) => (
                     <section key={g.story?.id ?? "none"} className="panel" style={{ padding: 0, gap: 0 }} aria-label={g.story ? `${g.story.key} ${g.story.title}` : "Scenarios"}>
                       {tree.stories.length > 0 && (
-                        <h3 className="group-head">{g.story ? <>{g.story.key} · {g.story.title}</> : "Not linked to a story"}</h3>
+                        <h3 className="group-head">{g.story ? <>{K(g.story.key)} · {g.story.title}</> : "Not linked to a story"}</h3>
                       )}
                       {g.list.map((s) => (
                         <div key={s.id} className="row" style={{ justifyContent: "space-between", padding: "14px 18px", borderBottom: "1px solid var(--rule)" }}>
                           <span className="stack" style={{ gap: 2, flex: "1 1 320px", minWidth: 0 }}>
-                            <span style={{ fontSize: 14, fontWeight: 600 }}>{s.key && <span className="muted" style={{ fontWeight: 500 }}>{s.key} · </span>}{s.title}</span>
+                            <Link className="list-title" href={reviewHref("scenario", s.id)} style={{ fontSize: 14, fontWeight: 600, textDecoration: "none" }}>{s.key && <span className="muted" style={{ fontWeight: 500 }}>{K(s.key)} · </span>}{s.title}</Link>
                             {s.situation && (
                               <span className="small" style={{ color: "var(--ink-2)" }}>
                                 {s.actor && <strong>{s.actor} </strong>}
@@ -352,7 +595,7 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
                                 {s.outcome && <> → {s.outcome}</>}
                               </span>
                             )}
-                            <span className="small muted">{s.requirementIds.map((k) => (critical.has(k) ? `${k} (critical)` : k)).join(", ")} · {plural(s.cases.length, "case")}{s.cases.length ? `: ${s.cases.map((x) => x.key).join(", ")}` : ""}</span>
+                            <span className="small muted">{s.requirementIds.map((k) => (critical.has(k) ? `${K(k)} (critical)` : K(k))).join(", ")} · {plural(s.cases.length, "case")}{s.cases.length ? `: ${KL(s.cases.map((x) => x.key))}` : ""}</span>
                           </span>
                           <span className="row" style={{ gap: 6 }}><span className="pill prio">{s.priority}</span><span className={`pill kind-${s.kind}`}>{KIND_LABEL[s.kind] ?? s.kind}</span></span>
                         </div>
@@ -373,16 +616,16 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
                       const story = c.scenario.storyId ? storyById.get(c.scenario.storyId) : undefined;
                       return (
                       <tr key={c.id}>
-                        <td className="muted nowrap">{c.key}</td>
-                        <td className="nowrap">{story ? <Link className="cell-link" href={`/projects/${id}/review?item=story:${story.id}`} title={story.title}>{story.key}</Link> : <span className="muted">–</span>}</td>
-                        <td className="nowrap" title={c.scenario.title}>{c.scenario.key ?? <span className="muted">–</span>}</td>
+                        <td className="muted nowrap">{K(c.key)}</td>
+                        <td className="nowrap">{story ? <Link className="cell-link" href={reviewHref("story", story.id)} title={story.title}>{K(story.key)}</Link> : <span className="muted">–</span>}</td>
+                        <td className="nowrap" title={c.scenario.title}>{c.scenario.key ? K(c.scenario.key) : <span className="muted">–</span>}</td>
                         <td>
-                          <Link className="cell-link" href={`/projects/${id}/review?item=tc:${c.id}`}>{c.title}</Link>
+                          <Link className="cell-link" href={reviewHref("tc", c.id)}>{c.title}</Link>
                           <div className="case-scenario">
                             <span className="row" style={{ gap: 6, flexWrap: "wrap" }}>
                               <span className={`pill kind-${c.scenario.kind}`}>{KIND_LABEL[c.scenario.kind] ?? c.scenario.kind}</span>
                               <span className="pill prio">{c.scenario.priority}</span>
-                              <span className="case-scenario-title">{c.scenario.key ? `${c.scenario.key} · ` : "Scenario: "}{c.scenario.title}</span>
+                              <span className="case-scenario-title">{c.scenario.key ? `${K(c.scenario.key)} · ` : "Scenario: "}{c.scenario.title}</span>
                             </span>
                             {c.scenario.situation && (
                               <span className="sub">
@@ -391,7 +634,7 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
                                 {c.scenario.outcome && <> → {c.scenario.outcome}</>}
                               </span>
                             )}
-                            {c.scenario.cases.length > 1 && <span className="sub">One of {c.scenario.cases.length} cases for this scenario: {c.scenario.cases.map((x) => x.key).join(", ")}</span>}
+                            {c.scenario.cases.length > 1 && <span className="sub">One of {c.scenario.cases.length} cases for this scenario: {KL(c.scenario.cases.map((x) => x.key))}</span>}
                           </div>
                         </td>
                         <td className="num">{c.steps.length}</td>
@@ -417,8 +660,8 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
                       return (
                         <div key={st.id} className="list-row">
                           <span>
-                            <Link className="list-title" href={`/projects/${id}/review?item=story:${st.id}`} style={{ textDecoration: "none" }}>{st.key} {st.title}</Link>
-                            <span className="list-sub">{st.critical ? "Critical · " : ""}covers {st.requirementIds.join(", ")}</span>
+                            <Link className="list-title" href={reviewHref("story", st.id)} style={{ textDecoration: "none" }}>{K(st.key)} {st.title}</Link>
+                            <span className="list-sub">{st.critical ? "Critical · " : ""}covers {KL(st.requirementIds)}</span>
                           </span>
                           <span className="row" style={{ gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
                             {k.happy ? <span className="pill kind-happy">{k.happy} positive</span> : <span className="pill gap-pill">No positive</span>}
@@ -442,8 +685,8 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
                   return (
                     <div key={r.id} className="list-row">
                       <span>
-                        <Link className="list-title" href={`/projects/${id}/review?item=req:${r.id}`} style={{ textDecoration: "none" }}>{r.key} {r.title}</Link>
-                        {isCritical && <span className="list-sub">Critical: {criticalWhy.get(r.key)}</span>}
+                        <Link className="list-title" href={reviewHref("req", r.id)} style={{ textDecoration: "none" }}>{K(r.key)} {r.title}</Link>
+                        {isCritical && <span className="list-sub">Critical: {KT(criticalWhy.get(r.key) ?? "")}</span>}
                         {first && <Link className="list-sub" href={first.href}>{citeLabel([first.id])}</Link>}
                       </span>
                       <span className="row" style={{ gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
@@ -491,9 +734,16 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
             ) : <div className="empty">No questions for the client.</div>
           )}
         </section>
+        )}
       </div>
     </Shell>
   );
+}
+
+/** The worker's progress report on a running job, if it has sent one. */
+function progressOf(r: AgentRun): Progress | null {
+  const p = (r.summary as { progress?: Progress } | null)?.progress;
+  return p && typeof p.total === "number" ? p : null;
 }
 
 function RunStatusText(status: string) {

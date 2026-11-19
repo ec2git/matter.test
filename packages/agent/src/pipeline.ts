@@ -2,7 +2,7 @@ import type { SourceType } from "@mattertest/core";
 import { chunkBlocks, chunkCues, type Chunk } from "./chunk";
 import { LoomTranscriptUnavailable, fetchLoomTranscript, type LoomVideo } from "./loom";
 import { parseDocx, parseHtml, parseMarkdown, parsePdf, parseTranscript } from "./parse";
-import { EXTRACT_SYSTEM, PLAN_SYSTEM, extractUser, planUser, topUpUser, type Passage, type PlanRequirement } from "./prompts";
+import { EXTRACT_SYSTEM, PLAN_SYSTEM, extractUser, planUser, topUpUser, type KeptWork, type Passage, type PlanRequirement } from "./prompts";
 import { Extraction, PlanDraft, ScenarioTopUp, coverageGaps, criticalKeys, resolveExtraction, resolvePlan, resolveScenarios, storyGaps, type ChunkRefs, type CoverageGap } from "./schemas";
 import { addUsage, type StructuredModel } from "./claude";
 
@@ -110,6 +110,9 @@ export type ProjectContext = {
   instructions?: string | null;
   /** Matter Design's QA guidelines (docs/qa-guidelines.md), for every project. */
   guidelines?: string | null;
+  /** The test plan this run is for, when the project has several: its name and what it covers. */
+  planName?: string | null;
+  focus?: string | null;
 };
 
 /** Ask Claude for the requirements and client questions in one source. */
@@ -140,23 +143,30 @@ export async function draftPlan(
   chunks: PlanInputChunk[],
   openQuestions: string[] = [],
   sourceNotes: { source: string; note: string }[] = [],
+  kept: KeptWork | null = null,
 ) {
   const { refs, refOf } = refChunks(chunks);
   const passages: Passage[] = chunks.map((c) => ({ ref: refOf.get(c.id)!, sourceName: c.sourceName, sourceType: c.sourceType, sectionPath: c.sectionPath, locator: c.locator, text: c.text }));
   const reqs: PlanRequirement[] = requirements.map((r) => ({ ...r, passageRefs: r.sourceChunkIds.map((id) => refOf.get(id)).filter((x): x is string => !!x) }));
-  const context = { ...ctx, requirements: reqs, passages, openQuestions, sourceNotes };
+  const context = { ...ctx, requirements: reqs, passages, openQuestions, sourceNotes, kept };
+  // Approved work counts towards coverage and can be linked to, but isn't redrafted.
+  const keptStories = (kept?.stories ?? []).map((st) => ({ ref: st.ref, critical: st.critical }));
+  const keptScenarios = (kept?.scenarios ?? []).map((sc) => ({ kind: sc.kind as "happy" | "negative" | "edge", priority: sc.priority as "P0", requirementKeys: sc.requirementKeys, storyRef: sc.storyRef }));
   const keys = requirements.map((r) => r.key);
   const known = new Set(keys);
   const res = await model({ schema: PlanDraft, system: PLAN_SYSTEM, guidelines: ctx.guidelines, user: planUser(context), effort: "high" });
-  const drafted = resolvePlan(res.data, known, refs);
+  const drafted = resolvePlan(res.data, known, refs, new Set(keptStories.map((x) => x.ref)));
   let usage = res.usage;
 
   // Default coverage: a positive scenario for every story and requirement, and a negative one for every critical
   // story and requirement. Anything missing gets one smaller follow-up call that drafts only those scenarios.
   const stories = drafted.stories;
-  const storyRefs = new Set(stories.map((x) => x.ref));
-  const critical = criticalKeys(drafted.critical, drafted.scenarios);
-  const gapsIn = (sc: typeof drafted.scenarios) => [...storyGaps(stories, sc), ...coverageGaps(keys, critical, sc)];
+  const storyRefs = new Set([...stories.map((x) => x.ref), ...keptStories.map((x) => x.ref)]);
+  const critical = criticalKeys(drafted.critical, [...drafted.scenarios, ...keptScenarios]);
+  const gapsIn = (sc: typeof drafted.scenarios) => {
+    const all = [...sc, ...keptScenarios];
+    return [...storyGaps([...stories, ...keptStories], all), ...coverageGaps(keys, critical, all)];
+  };
   const before = gapsIn(drafted.scenarios);
   let scenarios = drafted.scenarios;
   let report = drafted.report;
@@ -165,7 +175,15 @@ export async function draftPlan(
       schema: ScenarioTopUp,
       system: PLAN_SYSTEM,
       guidelines: ctx.guidelines,
-      user: topUpUser({ ...context, stories, existing: scenarios.map((x) => ({ title: x.title, kind: x.kind, requirementKeys: x.requirementKeys, storyRef: x.storyRef })), gaps: before }),
+      user: topUpUser({
+        ...context,
+        stories: [...(kept?.stories ?? []), ...stories],
+        existing: [
+          ...(kept?.scenarios ?? []).map((x) => ({ title: `${x.title} (approved)`, kind: x.kind, requirementKeys: x.requirementKeys, storyRef: x.storyRef })),
+          ...scenarios.map((x) => ({ title: x.title, kind: x.kind, requirementKeys: x.requirementKeys, storyRef: x.storyRef })),
+        ],
+        gaps: before,
+      }),
       effort: "medium",
     });
     usage = addUsage(usage, top.usage);

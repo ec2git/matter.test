@@ -50,6 +50,20 @@
       "when": 1794289034231,
       "tag": "0006_scenario_keys",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1794364816827,
+      "tag": "0007_plan_tracks",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1794371254084,
+      "tag": "0008_plan_numbers",
+      "breakpoints": true
     }
   ]
 }

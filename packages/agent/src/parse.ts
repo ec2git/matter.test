@@ -166,7 +166,8 @@ export function parseCaptions(src: string): Cue[] {
     const text = lines
       .slice(i + 1)
       .join(" ")
-      .replace(/<v\s+([^>]+)>/g, "$1: ")
+      // Voice tags name the speaker; Loom numbers unknown speakers (<v 0>), which says nothing, so those are dropped.
+      .replace(/<v\s+([^>]+)>/g, (_, who: string) => (/^\d+$/.test(who.trim()) ? "" : `${who.trim()}: `))
       .replace(/<[^>]+>/g, "")
       .replace(/\s+/g, " ")
       .trim();

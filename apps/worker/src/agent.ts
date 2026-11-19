@@ -1,13 +1,14 @@
 import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import { and, desc, eq, inArray, ne, or, sql } from "drizzle-orm";
-import { CONFLUENCE_MAX_PAGES, artefactPath, confluencePageUrl, type ConfluenceJob, type IngestJob, type PlanJob, type SourceType } from "@mattertest/core";
+import { and, desc, eq, inArray, isNull, ne, notInArray, or, sql } from "drizzle-orm";
+import { CONFLUENCE_MAX_PAGES, artefactPath, confluencePageUrl, type ConfluenceJob, type IngestJob, type PlanJob, type SourceType, type TrackJob } from "@mattertest/core";
 import {
   type Db,
   clientQuestions,
   clients,
   environments,
+  planTracks,
   projects,
   requirements,
   runs,
@@ -31,12 +32,14 @@ import {
   loadGuidelines,
   readPageTree,
   readSource,
-  resolvePageId,
+  resolveRoot,
   type ConfluenceConfig,
+  type KeptWork,
   type QaGuidelines,
   type Embedder,
   type PlanInputChunk,
   type ProjectContext,
+  type StoredChunk,
   type StructuredModel,
   type Usage,
 } from "@mattertest/agent";
@@ -61,6 +64,34 @@ async function start(db: Db, taskId: string, runId: string) {
   await db.update(runs).set({ status: "running", startedAt: new Date() }).where(eq(runs.id, runId));
   await db.update(tasks).set({ status: "running" }).where(eq(tasks.id, taskId));
 }
+
+/**
+ * Where a running job is, for the progress bar on Test assets: steps done out of the total, the step under way
+ * and how long it usually takes (the page fills the bar towards the step's end as time passes).
+ */
+export type RunProgress = { label: string; done: number; total: number; stepWeight: number; stepStartedAt: string; expectSec: number };
+
+async function progress(db: Db, runId: string, p: Omit<RunProgress, "stepStartedAt">) {
+  const value = JSON.stringify({ progress: { ...p, stepStartedAt: new Date().toISOString() } });
+  await db.update(runs).set({ summary: sql`coalesce(${runs.summary}, '{}'::jsonb) || ${value}::jsonb` }).where(eq(runs.id, runId));
+}
+
+/** Rough seconds for Claude to extract one source: longer sources take longer. */
+const extractSecs = (passages: number) => Math.min(300, 20 + Math.round(passages * 1.2));
+
+/** How long this project's plan drafts have taken lately, or a typical figure before there are any. */
+async function planSecs(db: Db, projectId: string): Promise<number> {
+  const [row] = await db
+    .select({ secs: sql<string | null>`avg(extract(epoch from ${runs.finishedAt} - ${runs.startedAt}))` })
+    .from(runs)
+    .innerJoin(tasks, eq(tasks.id, runs.taskId))
+    .where(and(eq(tasks.projectId, projectId), eq(tasks.kind, "plan"), eq(runs.status, "done"), sql`${runs.finishedAt} > now() - interval '30 days'`, sql`coalesce(${tasks.params}->>'newPlan', 'false') <> 'true'`));
+  const secs = Number(row?.secs ?? 0);
+  return secs > 30 ? Math.round(secs) : 170;
+}
+
+/** A step inside reading one source: its position among the source's steps, and how long it usually takes. */
+type StepReport = (s: { label: string; index: number; count: number; expectSec: number }) => Promise<void>;
 
 async function finish(db: Db, taskId: string, runId: string, status: "done" | "failed" | "needs-review", usage: Usage, summary: Record<string, unknown>) {
   await db
@@ -97,22 +128,61 @@ function nextNumber(keys: string[], prefix: string): number {
 const keyOf = (prefix: string, n: number, width: number) => `${prefix}-${String(n).padStart(width, "0")}`;
 
 type Source = typeof sources.$inferSelect;
+type Track = typeof planTracks.$inferSelect;
+
+/** The project's test plans in the order the team made them; a project with none gets a first one. */
+async function projectTracks(db: Db, projectId: string): Promise<Track[]> {
+  const rows = await db.select().from(planTracks).where(eq(planTracks.projectId, projectId)).orderBy(planTracks.position, planTracks.createdAt);
+  if (rows.length) return rows;
+  const [first] = await db.insert(planTracks).values({ projectId, number: 1, name: "Test plan" }).returning();
+  return [first!];
+}
+
+/** Does this test plan read this source? Null means every source in the project. */
+const usesSource = (t: Pick<Track, "sourceIds">, sourceId: string) => !t.sourceIds || t.sourceIds.includes(sourceId);
+
+type Extracted = { usage: Usage; requirements: number; questions: number; dropped: unknown; model: string };
+
+/**
+ * Extract one source's requirements and client questions for one test plan, with the plan's focus, replacing
+ * whatever that plan had from the source before. Requirement numbers continue across the project.
+ */
+async function extractInto(db: Db, deps: AgentDeps, ctx: ProjectContext, source: Source, track: Track, chunks: StoredChunk[], title?: string): Promise<Extracted> {
+  const extracted = await extractRequirements(deps.model, { ...ctx, planName: track.name, focus: track.focus }, { name: title ?? source.meta.title ?? source.name, type: source.type, note: source.meta.note }, chunks);
+  await db.delete(requirements).where(and(eq(requirements.sourceId, source.id), eq(requirements.trackId, track.id)));
+  await db.delete(clientQuestions).where(and(eq(clientQuestions.sourceId, source.id), eq(clientQuestions.trackId, track.id)));
+  // Requirement numbers count within the test plan (shown as TP1-REQ-01).
+  const existing = await db.select({ key: requirements.key }).from(requirements).where(eq(requirements.trackId, track.id));
+  let n = nextNumber(existing.map((r) => r.key), "REQ");
+  if (extracted.requirements.length) {
+    await db.insert(requirements).values(
+      extracted.requirements.map((r) => ({ projectId: source.projectId, sourceId: source.id, trackId: track.id, key: keyOf("REQ", n++, 2), title: r.title, text: r.text, area: r.area, acceptanceCriteria: r.acceptanceCriteria, sourceChunkIds: r.sourceChunkIds })),
+    );
+  }
+  if (extracted.questions.length) {
+    await db.insert(clientQuestions).values(extracted.questions.map((q) => ({ projectId: source.projectId, sourceId: source.id, trackId: track.id, question: q.question, why: q.why, sourceChunkIds: q.sourceChunkIds })));
+  }
+  return { usage: extracted.usage, requirements: extracted.requirements.length, questions: extracted.questions.length, dropped: extracted.report, model: extracted.model };
+}
 
 type IngestOutcome =
-  | { ok: true; usage: Usage; requirements: number; questions: number; summary: Record<string, unknown> }
+  | { ok: true; usage: Usage; requirements: number; questions: number; tracks: { id: string; requirements: number }[]; summary: Record<string, unknown> }
   | { ok: false; usage: Usage; error: string; needsTranscript: boolean; cause: unknown };
 
 /**
- * Read, chunk, embed and extract one source, keeping its status up to date. Never throws: failures are
- * recorded on the source and returned, with whatever the model calls cost.
+ * Read, chunk and embed one source, then extract it for each test plan that uses it, keeping its status up to
+ * date. Never throws: failures are recorded on the source and returned, with whatever the model calls cost.
  */
-async function ingestSource(db: Db, source: Source, deps: AgentDeps): Promise<IngestOutcome> {
+async function ingestSource(db: Db, source: Source, deps: AgentDeps, onStep: StepReport = async () => {}): Promise<IngestOutcome> {
   const log = deps.log ?? (() => {});
+  const title = source.meta.title ?? source.name;
   await db.update(sources).set({ status: "ingesting", error: null }).where(eq(sources.id, source.id));
   let usage = NO_USAGE;
   try {
     const file = source.fileUri ? await readFile(artefactPath(source.fileUri)) : undefined;
     log(`reading ${source.type} source "${source.name}"`);
+    // Plans that will read it aren't known yet; assume one extraction step after reading.
+    await onStep({ label: `Reading ${title}`, index: 0, count: 2, expectSec: source.type === "loom" ? 15 : 10 });
     const { chunks, meta } = await readSource({ type: source.type as SourceType, file, link: source.uri }, deps.fetch);
     log(`${chunks.length} chunks`);
 
@@ -138,52 +208,74 @@ async function ingestSource(db: Db, source: Source, deps: AgentDeps): Promise<In
     const idAt = new Map(stored.map((s) => [s.position, s.id]));
     const storedChunks = chunks.map((c) => ({ ...c, id: idAt.get(c.position)! }));
 
-    const ctx = await projectContext(db, source.projectId, deps);
-    log("extracting requirements");
-    const extracted = await extractRequirements(deps.model, ctx, { name: meta.title ?? source.meta.title ?? source.name, type: source.type, note: source.meta.note }, storedChunks);
-    usage = extracted.usage;
-
-    const existing = await db.select({ key: requirements.key }).from(requirements).where(eq(requirements.projectId, source.projectId));
-    let n = nextNumber(existing.map((r) => r.key), "REQ");
-    if (extracted.requirements.length) {
-      await db.insert(requirements).values(
-        extracted.requirements.map((r) => ({ projectId: source.projectId, sourceId: source.id, key: keyOf("REQ", n++, 2), title: r.title, text: r.text, area: r.area, acceptanceCriteria: r.acceptanceCriteria, sourceChunkIds: r.sourceChunkIds })),
-      );
-    }
-    if (extracted.questions.length) {
-      await db.insert(clientQuestions).values(extracted.questions.map((q) => ({ projectId: source.projectId, sourceId: source.id, question: q.question, why: q.why, sourceChunkIds: q.sourceChunkIds })));
-    }
-
-    // An older version of the same document no longer feeds the plan: same link, or for uploads the same name.
+    // An older version of the same document no longer feeds the plans: same link, or for uploads the same name.
     // Confluence pages match by link only, since two pages in a space can share a title.
     const sameDoc = source.uri ? (source.type === "confluence" ? eq(sources.uri, source.uri) : or(eq(sources.uri, source.uri), eq(sources.name, source.name))) : eq(sources.name, source.name);
-    const older = await db
-      .select({ id: sources.id })
-      .from(sources)
-      .where(and(eq(sources.projectId, source.projectId), ne(sources.id, source.id), sql`${sources.version} < ${source.version}`, sameDoc));
+    const older = (
+      await db
+        .select({ id: sources.id })
+        .from(sources)
+        .where(and(eq(sources.projectId, source.projectId), ne(sources.id, source.id), sql`${sources.version} < ${source.version}`, sameDoc))
+    ).map((o) => o.id);
+
+    // Test plans that picked the older version use this one instead.
+    const tracks = await projectTracks(db, source.projectId);
+    for (const t of tracks) {
+      if (t.sourceIds && older.some((id) => t.sourceIds!.includes(id)) && !t.sourceIds.includes(source.id)) {
+        t.sourceIds = [...t.sourceIds.filter((id) => !older.includes(id)), source.id];
+        await db.update(planTracks).set({ sourceIds: t.sourceIds }).where(eq(planTracks.id, t.id));
+      }
+    }
+    const using = tracks.filter((t) => usesSource(t, source.id));
+
+    const ctx = await projectContext(db, source.projectId, deps);
+    const perTrack: { id: string; name: string; requirements: number; questions: number }[] = [];
+    let dropped: unknown;
+    let model: string | undefined;
+    for (const [i, t] of using.entries()) {
+      log(`extracting requirements for "${t.name}"`);
+      await onStep({
+        label: tracks.length > 1 ? `Claude is reading ${meta.title ?? title} for ${t.name}` : `Claude is extracting requirements from ${meta.title ?? title}`,
+        index: 1 + i,
+        count: 1 + using.length,
+        expectSec: extractSecs(chunks.length),
+      });
+      const out = await extractInto(db, deps, ctx, source, t, storedChunks, meta.title);
+      usage = addUsage(usage, out.usage);
+      perTrack.push({ id: t.id, name: t.name, requirements: out.requirements, questions: out.questions });
+      dropped = out.dropped;
+      model = out.model;
+    }
+
     if (older.length) {
-      const ids = older.map((o) => o.id);
-      await db.update(sources).set({ status: "superseded" }).where(inArray(sources.id, ids));
-      await db.update(requirements).set({ reviewState: "superseded" }).where(inArray(requirements.sourceId, ids));
+      await db.update(sources).set({ status: "superseded" }).where(inArray(sources.id, older));
+      await db.update(requirements).set({ reviewState: "superseded" }).where(inArray(requirements.sourceId, older));
+      // Questions about the old version are no longer the client's to answer.
+      await db.update(clientQuestions).set({ status: "withdrawn" }).where(and(inArray(clientQuestions.sourceId, older), eq(clientQuestions.status, "open")));
     }
 
     await db
       .update(sources)
       .set({ status: "ready", error: null, meta: { ...source.meta, ...meta, chunks: chunks.length } })
       .where(eq(sources.id, source.id));
+    const reqCount = perTrack.reduce((n, t) => n + t.requirements, 0);
+    const questionCount = perTrack.reduce((n, t) => n + t.questions, 0);
     return {
       ok: true,
       usage,
-      requirements: extracted.requirements.length,
-      questions: extracted.questions.length,
+      requirements: reqCount,
+      questions: questionCount,
+      tracks: perTrack.map((t) => ({ id: t.id, requirements: t.requirements })),
       summary: {
         chunks: chunks.length,
         embedded: !!vectors,
         ...(embedError ? { embedError } : {}),
-        requirements: extracted.requirements.length,
-        questions: extracted.questions.length,
-        dropped: extracted.report,
-        model: extracted.model,
+        requirements: reqCount,
+        questions: questionCount,
+        plans: perTrack,
+        ...(using.length ? {} : { notInAnyPlan: true }),
+        ...(dropped ? { dropped } : {}),
+        ...(model ? { model } : {}),
         // What the agent was told, kept with the run so a reviewer can see why the output looks the way it does.
         ...(ctx.instructions?.trim() ? { instructions: ctx.instructions.trim() } : {}),
         ...(source.meta.note ? { sourceNote: source.meta.note } : {}),
@@ -203,10 +295,17 @@ async function ingestSource(db: Db, source: Source, deps: AgentDeps): Promise<In
 }
 
 /** Queue a plan run after ingest, as a child of the ingest task. */
-async function queuePlanAfter(db: Db, deps: AgentDeps, projectId: string, parentTaskId: string, params: Record<string, unknown>) {
-  const [task] = await db.insert(tasks).values({ projectId, kind: "plan", trigger: "manual", title: "Draft test plan", params, parentTaskId }).returning();
-  const [run] = await db.insert(runs).values({ taskId: task!.id }).returning();
-  await deps.queuePlan({ taskId: task!.id, runId: run!.id, projectId });
+async function queuePlanAfter(db: Db, deps: AgentDeps, projectId: string, parentTaskId: string, params: Record<string, unknown>, trackIds: string[]) {
+  const names = new Map((await db.select({ id: planTracks.id, name: planTracks.name }).from(planTracks).where(eq(planTracks.projectId, projectId))).map((t) => [t.id, t.name]));
+  for (const trackId of new Set(trackIds)) {
+    const name = names.get(trackId);
+    const [task] = await db
+      .insert(tasks)
+      .values({ projectId, kind: "plan", trigger: "manual", title: names.size > 1 && name ? `Draft test plan: ${name}` : "Draft test plan", params: { ...params, trackId }, parentTaskId })
+      .returning();
+    const [run] = await db.insert(runs).values({ taskId: task!.id }).returning();
+    await deps.queuePlan({ taskId: task!.id, runId: run!.id, projectId, trackId });
+  }
 }
 
 /** Read, chunk, embed and extract one source; then queue a plan run. */
@@ -217,7 +316,7 @@ export async function runIngest(db: Db, job: IngestJob, deps: AgentDeps) {
     await finish(db, job.taskId, job.runId, "failed", NO_USAGE, { error: "Source not found" });
     return;
   }
-  const out = await ingestSource(db, source, deps);
+  const out = await ingestSource(db, source, deps, (st) => progress(db, job.runId, { label: st.label, done: st.index / st.count, total: 1, stepWeight: 1 / st.count, expectSec: st.expectSec }));
   if (!out.ok) {
     if (out.needsTranscript) {
       await finish(db, job.taskId, job.runId, "needs-review", out.usage, { needsTranscript: true, error: out.error });
@@ -227,7 +326,7 @@ export async function runIngest(db: Db, job: IngestJob, deps: AgentDeps) {
     throw out.cause;
   }
   await finish(db, job.taskId, job.runId, "done", out.usage, out.summary);
-  if (job.thenPlan && out.requirements) await queuePlanAfter(db, deps, source.projectId, job.taskId, { sourceId: source.id });
+  if (job.thenPlan) await queuePlanAfter(db, deps, source.projectId, job.taskId, { sourceId: source.id }, out.tracks.filter((t) => t.requirements).map((t) => t.id));
 }
 
 /**
@@ -246,17 +345,19 @@ export async function runConfluence(db: Db, job: ConfluenceJob, deps: AgentDeps)
     if (!cfg) throw new ConfluenceError(NOT_SET_UP);
     const f = deps.fetch ?? fetch;
 
-    let roots: { pageId: string; includeChildren: boolean; title?: string }[];
+    type Root = { pageId: string; includeChildren: boolean; folder?: boolean; title?: string };
+    let roots: Root[];
     if (job.sync) {
       const live = await db
         .select()
         .from(sources)
-        .where(and(eq(sources.projectId, job.projectId), eq(sources.type, "confluence"), ne(sources.status, "superseded")));
-      const byRoot = new Map<string, { pageId: string; includeChildren: boolean; title?: string }>();
+        .where(and(eq(sources.projectId, job.projectId), eq(sources.type, "confluence"), notInArray(sources.status, ["superseded", "removed"])));
+      const byRoot = new Map<string, Root>();
       for (const s of live) {
         const c = s.meta.confluence;
         if (!c) continue;
-        const root = byRoot.get(c.rootPageId) ?? { pageId: c.rootPageId, includeChildren: false };
+        // A folder has no page of its own: its pages carry rootKind, and the whole folder is read again.
+        const root = byRoot.get(c.rootPageId) ?? (c.rootKind === "folder" ? { pageId: c.rootPageId, includeChildren: true, folder: true } : { pageId: c.rootPageId, includeChildren: false });
         if (c.pageId === c.rootPageId) Object.assign(root, { includeChildren: !!c.includeChildren, title: s.name });
         byRoot.set(c.rootPageId, root);
       }
@@ -264,22 +365,30 @@ export async function runConfluence(db: Db, job: ConfluenceJob, deps: AgentDeps)
       if (!roots.length) throw new ConfluenceError("There are no Confluence pages in this project yet.");
     } else {
       if (!job.link) throw new ConfluenceError("No Confluence link was given.");
-      roots = [{ pageId: await resolvePageId(cfg, job.link, f), includeChildren: job.includeChildren }];
+      const r = await resolveRoot(cfg, job.link, f);
+      roots = [r.kind === "folder" ? { pageId: r.id, includeChildren: true, folder: true } : { pageId: r.id, includeChildren: job.includeChildren }];
     }
 
+    await progress(db, job.runId, { label: job.sync ? "Checking Confluence for changes" : "Reading pages from Confluence", done: 0, total: 1, stepWeight: 1, expectSec: 8 });
     const seen = new Set<string>();
     const toIngest: Source[] = [];
+    const planTrackIds: string[] = [];
     for (const root of roots) {
       let tree: Awaited<ReturnType<typeof readPageTree>>;
       try {
-        log(`reading Confluence page ${root.pageId}${root.includeChildren ? " and its child pages" : ""}`);
-        tree = await readPageTree(cfg, root.pageId, { includeChildren: root.includeChildren }, f);
+        log(root.folder ? `reading the pages in Confluence folder ${root.pageId}` : `reading Confluence page ${root.pageId}${root.includeChildren ? " and its child pages" : ""}`);
+        tree = await readPageTree(cfg, root.pageId, { includeChildren: root.includeChildren, folder: root.folder }, f);
       } catch (e) {
         if (!job.sync || !(e instanceof ConfluenceError)) throw e;
         problems.push(`${root.title ?? `Page ${root.pageId}`}: ${e.message}`);
         continue;
       }
-      if (tree.truncated) problems.push(`Only the first ${CONFLUENCE_MAX_PAGES} pages under "${tree.pages[0]!.title}" were read.`);
+      if (tree.truncated) problems.push(`Only the first ${CONFLUENCE_MAX_PAGES} pages under "${tree.rootTitle}" were read.`);
+      if (!tree.pages.length) {
+        if (!job.sync) throw new ConfluenceError(`The folder "${tree.rootTitle}" has no pages in it.`);
+        problems.push(`${tree.rootTitle}: the folder has no pages in it.`);
+        continue;
+      }
       for (const page of tree.pages) {
         if (seen.has(page.id)) continue;
         seen.add(page.id);
@@ -291,10 +400,20 @@ export async function runConfluence(db: Db, job: ConfluenceJob, deps: AgentDeps)
           .orderBy(desc(sources.version))
           .limit(1);
         const isRoot = page.id === root.pageId;
-        if (latest && latest.meta.confluence?.version === page.version) {
-          if (latest.status === "failed") {
-            toIngest.push(latest); // same content, failed last time: try it again
-            counts.changed++;
+        // A page the team removed stays out of update checks until they restore it, even if it changes in
+        // Confluence. Adding it again (on its own or in a folder) reads it as a new version.
+        const readded = latest?.status === "removed" && !job.sync;
+        if (latest?.status === "removed" && job.sync) {
+          counts.unchanged++;
+          continue;
+        }
+        if (latest && !readded && latest.meta.confluence?.version === page.version) {
+          // Same content, but it failed last time or the job was cut off before reading it: read it now.
+          if (latest.status === "failed" || latest.status === "queued" || latest.status === "ingesting") {
+            toIngest.push(latest);
+            // A page never read (the job was cut off) counts as new; one that failed is read again.
+            if (latest.status === "failed" || latest.version > 1) counts.changed++;
+            else counts.added++;
           } else {
             counts.unchanged++;
           }
@@ -321,26 +440,30 @@ export async function runConfluence(db: Db, job: ConfluenceJob, deps: AgentDeps)
             version: (latest?.version ?? 0) + 1,
             meta: {
               title: page.title,
-              // A note given when adding applies to every page read through it; a re-read keeps the page's last note.
-              ...((job.note ?? latest?.meta.note) ? { note: job.note ?? latest?.meta.note } : {}),
-              confluence: { pageId: page.id, version: page.version, webUrl: page.webUrl, rootPageId: root.pageId, ...(isRoot ? { includeChildren: root.includeChildren } : {}) },
+              // A note given when adding applies to every page read through it; a re-read keeps the page's last note
+              // (a removed page added again starts afresh).
+              ...((job.note ?? (readded ? undefined : latest?.meta.note)) ? { note: job.note ?? latest?.meta.note } : {}),
+              confluence: { pageId: page.id, version: page.version, webUrl: page.webUrl, rootPageId: root.pageId, ...(isRoot ? { includeChildren: root.includeChildren } : {}), ...(root.folder ? { rootKind: "folder" as const } : {}), rootTitle: tree.rootTitle },
             },
             createdBy: job.requestedBy ?? null,
           })
           .returning();
-        if (latest) counts.changed++;
+        if (latest && !readded) counts.changed++;
         else counts.added++;
         toIngest.push(source!);
       }
     }
     counts.pages = seen.size;
 
-    for (const source of toIngest) {
-      const out = await ingestSource(db, source, deps);
+    for (const [n, source] of toIngest.entries()) {
+      const out = await ingestSource(db, source, deps, (st) =>
+        progress(db, job.runId, { label: `Page ${n + 1} of ${toIngest.length}: ${st.label}`, done: n + st.index / st.count, total: toIngest.length, stepWeight: 1 / st.count, expectSec: st.expectSec }),
+      );
       usage = addUsage(usage, out.usage);
       if (out.ok) {
         counts.requirements += out.requirements;
         counts.questions += out.questions;
+        planTrackIds.push(...out.tracks.filter((t) => t.requirements).map((t) => t.id));
       } else {
         counts.failed++;
         problems.push(`${source.name}: ${out.error}`);
@@ -353,7 +476,7 @@ export async function runConfluence(db: Db, job: ConfluenceJob, deps: AgentDeps)
       ...(problems.length ? { problems } : {}),
       ...(allFailed ? { error: problems[0] } : {}),
     });
-    if (counts.requirements) await queuePlanAfter(db, deps, job.projectId, job.taskId, { confluence: true });
+    if (planTrackIds.length) await queuePlanAfter(db, deps, job.projectId, job.taskId, { confluence: true }, planTrackIds);
   } catch (e) {
     if (e instanceof AgentError) usage = addUsage(usage, e.usage);
     await finish(db, job.taskId, job.runId, "failed", usage, { ...counts, error: (e as Error).message, ...(problems.length ? { problems } : {}) });
@@ -361,17 +484,75 @@ export async function runConfluence(db: Db, job: ConfluenceJob, deps: AgentDeps)
   }
 }
 
-/** Draft a new plan version from the project's live requirements. */
+/**
+ * Start a new test plan: extract each of its sources (already read and chunked) again with the plan's focus, then
+ * queue a plan run for its first version. Other test plans are untouched.
+ */
+export async function runTrack(db: Db, job: TrackJob, deps: AgentDeps) {
+  const log = deps.log ?? (() => {});
+  await start(db, job.taskId, job.runId);
+  let usage = NO_USAGE;
+  try {
+    const [track] = await db.select().from(planTracks).where(and(eq(planTracks.id, job.trackId), eq(planTracks.projectId, job.projectId)));
+    if (!track) throw new Error("Test plan not found");
+    const ready = (await db.select().from(sources).where(and(eq(sources.projectId, job.projectId), eq(sources.status, "ready"))).orderBy(sources.createdAt)).filter((x) => usesSource(track, x.id));
+    if (!ready.length) throw new Error("None of this plan's sources are ready to read. Add a source or pick another.");
+    if (job.reset) {
+      await db.delete(requirements).where(eq(requirements.trackId, track.id));
+      await db.delete(clientQuestions).where(eq(clientQuestions.trackId, track.id));
+    }
+    const ctx = await projectContext(db, job.projectId, deps);
+    let reqCount = 0;
+    let questionCount = 0;
+    for (const [n, source] of ready.entries()) {
+      const rows = await db.select().from(sourceChunks).where(eq(sourceChunks.sourceId, source.id)).orderBy(sourceChunks.position);
+      const chunks: StoredChunk[] = rows.map((c) => ({ id: c.id, position: c.position, sectionPath: c.sectionPath, locator: c.locator, text: c.text }));
+      if (!chunks.length) continue;
+      await progress(db, job.runId, {
+        label: `${ready.length > 1 ? `Source ${n + 1} of ${ready.length}: ` : ""}Claude is reading ${source.meta.title ?? source.name} for ${track.name}`,
+        done: n,
+        total: ready.length,
+        stepWeight: 1,
+        expectSec: extractSecs(chunks.length),
+      });
+      log(`extracting "${source.meta.title ?? source.name}" for "${track.name}"`);
+      const out = await extractInto(db, deps, ctx, source, track, chunks);
+      usage = addUsage(usage, out.usage);
+      reqCount += out.requirements;
+      questionCount += out.questions;
+    }
+    await finish(db, job.taskId, job.runId, "done", usage, {
+      plan: track.name,
+      ...(track.focus ? { focus: track.focus } : {}),
+      sources: ready.length,
+      requirements: reqCount,
+      questions: questionCount,
+      ...(reqCount ? {} : { error: "The sources say nothing within this plan's focus." }),
+      ...(ctx.instructions?.trim() ? { instructions: ctx.instructions.trim() } : {}),
+      ...(ctx.guidelinesVersion ? { guidelinesVersion: ctx.guidelinesVersion } : {}),
+    });
+    if (reqCount) await queuePlanAfter(db, deps, job.projectId, job.taskId, { newPlan: true }, [track.id]);
+  } catch (e) {
+    if (e instanceof AgentError) usage = addUsage(usage, e.usage);
+    await finish(db, job.taskId, job.runId, "failed", usage, { error: (e as Error).message });
+    throw e;
+  }
+}
+
+/** Draft a new version of one test plan from its live requirements. */
 export async function runPlan(db: Db, job: PlanJob, deps: AgentDeps) {
   const log = deps.log ?? (() => {});
   await start(db, job.taskId, job.runId);
   let usage = NO_USAGE;
   try {
+    const tracks = await projectTracks(db, job.projectId);
+    const track = job.trackId ? tracks.find((t) => t.id === job.trackId) : tracks[0];
+    if (!track) throw new Error("Test plan not found");
     const reqs = await db
       .select({ r: requirements })
       .from(requirements)
       .innerJoin(sources, eq(sources.id, requirements.sourceId))
-      .where(and(eq(requirements.projectId, job.projectId), inArray(requirements.reviewState, ["needs-review", "approved"]), eq(sources.status, "ready")))
+      .where(and(eq(requirements.projectId, job.projectId), eq(requirements.trackId, track.id), inArray(requirements.reviewState, ["needs-review", "approved"]), eq(sources.status, "ready")))
       .orderBy(requirements.key);
     if (!reqs.length) throw new Error("There are no requirements to plan from. Add a source first.");
 
@@ -387,9 +568,60 @@ export async function runPlan(db: Db, job: PlanJob, deps: AgentDeps) {
     const shown = total <= PLAN_CONTEXT_CHARS ? all : all.filter((x) => cited.has(x.c.id));
     const chunks: PlanInputChunk[] = shown.map((x) => ({ ...x.c, sourceName: x.title ?? x.sourceName, sourceType: x.sourceType }));
 
-    const questions = await db.select({ q: clientQuestions.question }).from(clientQuestions).where(and(eq(clientQuestions.projectId, job.projectId), eq(clientQuestions.status, "open")));
-    const ctx = await projectContext(db, job.projectId, deps);
-    log(`planning from ${reqs.length} requirements and ${chunks.length} passages`);
+    const questions = await db.select({ q: clientQuestions.question }).from(clientQuestions).where(and(eq(clientQuestions.projectId, job.projectId), eq(clientQuestions.trackId, track.id), eq(clientQuestions.status, "open")));
+    const ctx = { ...(await projectContext(db, job.projectId, deps)), planName: track.name, focus: track.focus };
+
+    // Approved work moves into the new plan unchanged: approved user stories, and approved test cases with their
+    // scenarios. Claude sees it, plans around it and doesn't redraft it. Work whose requirements have all gone
+    // (source removed or replaced) stays behind with the old plan.
+    const liveKeys = new Set(reqs.map((x) => x.r.key));
+    const activePlans = db.select({ id: testPlans.id }).from(testPlans).where(and(eq(testPlans.trackId, track.id), ne(testPlans.status, "superseded")));
+    const approvedStories = (
+      await db.select().from(userStories).where(and(inArray(userStories.planId, activePlans), eq(userStories.reviewState, "approved"))).orderBy(userStories.key)
+    ).filter((st) => st.requirementIds.some((k) => liveKeys.has(k)));
+    const keptRefOfStory = new Map(approvedStories.map((st, i) => [st.id, `A${i + 1}`]));
+    const approvedRows = await db
+      .select({ c: testCases, s: scenarios })
+      .from(testCases)
+      .innerJoin(scenarios, eq(scenarios.id, testCases.scenarioId))
+      .where(and(inArray(scenarios.planId, activePlans), eq(testCases.reviewState, "approved")))
+      .orderBy(scenarios.position, testCases.key);
+    const keptScenarios = new Map<string, { s: (typeof approvedRows)[number]["s"]; cases: (typeof approvedRows)[number]["c"][] }>();
+    for (const row of approvedRows) {
+      if (!row.s.requirementIds.some((k) => liveKeys.has(k))) continue;
+      const entry = keptScenarios.get(row.s.id) ?? { s: row.s, cases: [] };
+      entry.cases.push(row.c);
+      keptScenarios.set(row.s.id, entry);
+    }
+    const kept: KeptWork = {
+      stories: approvedStories.map((st) => ({
+        ref: keptRefOfStory.get(st.id)!,
+        key: st.key,
+        title: st.title,
+        actor: st.actor,
+        want: st.want,
+        soThat: st.soThat,
+        requirementKeys: st.requirementIds.filter((k) => liveKeys.has(k)),
+        critical: st.critical,
+      })),
+      scenarios: [...keptScenarios.values()].map(({ s: x, cases }) => ({
+        key: x.key,
+        title: x.title,
+        kind: x.kind,
+        priority: x.priority,
+        requirementKeys: x.requirementIds.filter((k) => liveKeys.has(k)),
+        storyRef: x.storyId ? (keptRefOfStory.get(x.storyId) ?? null) : null,
+        cases: cases.map((c) => ({ key: c.key, title: c.title })),
+      })),
+    };
+    log(`planning from ${reqs.length} requirements and ${chunks.length} passages; keeping ${kept.stories.length} approved stories and ${approvedRows.length} approved test cases`);
+    await progress(db, job.runId, {
+      label: `Claude is drafting ${tracks.length > 1 ? `the ${track.name} plan` : "the plan"}: user stories, scenarios and test cases from ${reqs.length} requirements`,
+      done: 0,
+      total: 1,
+      stepWeight: 0.95,
+      expectSec: await planSecs(db, job.projectId),
+    });
     const drafted = await draftPlan(
       deps.model,
       ctx,
@@ -397,19 +629,21 @@ export async function runPlan(db: Db, job: PlanJob, deps: AgentDeps) {
       chunks,
       questions.map((q) => q.q),
       [...new Map(all.filter((x) => x.note).map((x) => [x.c.sourceId, { source: x.title ?? x.sourceName, note: x.note! }])).values()],
+      kept,
     );
     usage = drafted.usage;
 
-    const [prev] = await db.select({ version: testPlans.version }).from(testPlans).where(eq(testPlans.projectId, job.projectId)).orderBy(desc(testPlans.version)).limit(1);
-    // Numbers continue after the test cases and stories someone has reviewed (approved, rejected or edited), so a
-    // number that may be referenced elsewhere is never reused. Unreviewed drafts are throwaway: their numbers recycle.
+    const [prev] = await db.select({ version: testPlans.version }).from(testPlans).where(eq(testPlans.trackId, track.id)).orderBy(desc(testPlans.version)).limit(1);
+    // Numbers count within the test plan (shown as TP1-TC-004) and continue after the test cases and stories
+    // someone has reviewed (approved, rejected or edited), so a number that may be referenced elsewhere is never
+    // reused. Unreviewed drafts are throwaway: their numbers recycle.
     const reviewed = ["approved", "rejected"];
     const keys = await db
       .select({ key: testCases.key })
       .from(testCases)
       .innerJoin(scenarios, eq(scenarios.id, testCases.scenarioId))
       .innerJoin(testPlans, eq(testPlans.id, scenarios.planId))
-      .where(and(eq(testPlans.projectId, job.projectId), or(inArray(testCases.reviewState, reviewed), eq(testCases.edited, true))));
+      .where(and(eq(testPlans.trackId, track.id), or(inArray(testCases.reviewState, reviewed), eq(testCases.edited, true))));
     let tc = nextNumber(keys.map((k) => k.key), "TC");
     // A scenario's number is kept once any of its test cases has been reviewed or edited.
     const scenarioKeys = await db
@@ -417,28 +651,41 @@ export async function runPlan(db: Db, job: PlanJob, deps: AgentDeps) {
       .from(scenarios)
       .innerJoin(testPlans, eq(testPlans.id, scenarios.planId))
       .innerJoin(testCases, eq(testCases.scenarioId, scenarios.id))
-      .where(and(eq(testPlans.projectId, job.projectId), or(inArray(testCases.reviewState, reviewed), eq(testCases.edited, true))));
+      .where(and(eq(testPlans.trackId, track.id), or(inArray(testCases.reviewState, reviewed), eq(testCases.edited, true))));
     let sc = nextNumber(scenarioKeys.flatMap((k) => (k.key ? [k.key] : [])), "SC");
     const storyKeys = await db
       .select({ key: userStories.key })
       .from(userStories)
       .innerJoin(testPlans, eq(testPlans.id, userStories.planId))
-      .where(and(eq(testPlans.projectId, job.projectId), inArray(userStories.reviewState, reviewed)));
+      .where(and(eq(testPlans.trackId, track.id), inArray(userStories.reviewState, reviewed)));
     let us = nextNumber(storyKeys.map((k) => k.key), "US");
 
-    // Keep each story's scenarios together (gap-filled ones arrive last), in story order; unlinked ones go at the end.
-    const storyOrder = new Map(drafted.stories.map((st, i) => [st.ref, i]));
-    const ordered = drafted.scenarios
-      .map((sc, i) => ({ sc, i }))
-      .sort((a, b) => (storyOrder.get(a.sc.storyRef ?? "") ?? Infinity) - (storyOrder.get(b.sc.storyRef ?? "") ?? Infinity) || a.i - b.i)
-      .map((x) => x.sc);
-    // Stories get project-wide keys (US-07) in the order Claude gave them; gaps name stories by those keys too.
-    const keyOfStory = new Map(drafted.stories.map((st) => [st.ref, keyOf("US", us++, 2)]));
+    // Stories: approved ones first (keeping their keys), then new ones with project-wide keys (US-07) in Claude's order.
+    const allStories = [...kept.stories.map((st) => ({ ref: st.ref, requirementKeys: st.requirementKeys })), ...drafted.stories];
+    const storyOrder = new Map(allStories.map((st, i) => [st.ref, i]));
+    const keyOfStory = new Map<string, string>([...kept.stories.map((st) => [st.ref, st.key] as [string, string]), ...drafted.stories.map((st) => [st.ref, keyOf("US", us++, 2)] as [string, string])]);
+    // An approved scenario whose story wasn't approved joins the story that shares most of its requirements.
+    const bestStory = (keys: string[]) => {
+      let best: { ref: string; n: number } | null = null;
+      for (const st of allStories) {
+        const n = st.requirementKeys.filter((k) => keys.includes(k)).length;
+        if (n && (!best || n > best.n)) best = { ref: st.ref, n };
+      }
+      return best?.ref ?? null;
+    };
+    type Entry = { storyRef: string | null; i: number } & ({ kind: "kept"; row: (typeof approvedRows)[number]["s"]; cases: (typeof approvedRows)[number]["c"][] } | { kind: "new"; draft: (typeof drafted.scenarios)[number] });
+    const entries: Entry[] = [
+      ...[...keptScenarios.values()].map(({ s: row, cases }, i): Entry => ({ kind: "kept", row, cases, storyRef: (row.storyId && keptRefOfStory.get(row.storyId)) || bestStory(row.requirementIds), i })),
+      ...drafted.scenarios.map((d, i): Entry => ({ kind: "new", draft: d, storyRef: d.storyRef, i: keptScenarios.size + i })),
+    ];
+    // Keep each story's scenarios together (approved first, gap-filled ones no longer last), in story order.
+    const ordered = entries.sort((a, b) => (storyOrder.get(a.storyRef ?? "") ?? Infinity) - (storyOrder.get(b.storyRef ?? "") ?? Infinity) || a.i - b.i);
     const gaps = drafted.plan.gaps.map((g) => ({ ...g, key: keyOfStory.get(g.key) ?? g.key }));
 
+    await progress(db, job.runId, { label: "Saving the plan", done: 0.95, total: 1, stepWeight: 0.05, expectSec: 3 });
     const caseCount = await db.transaction(async (tx) => {
       // Earlier drafts give way to the new one; anything already approved stays approved.
-      const oldPlans = await tx.select({ id: testPlans.id }).from(testPlans).where(and(eq(testPlans.projectId, job.projectId), eq(testPlans.status, "draft")));
+      const oldPlans = await tx.select({ id: testPlans.id }).from(testPlans).where(and(eq(testPlans.trackId, track.id), eq(testPlans.status, "draft")));
       if (oldPlans.length) {
         const ids = oldPlans.map((p) => p.id);
         await tx.update(testPlans).set({ status: "superseded" }).where(inArray(testPlans.id, ids));
@@ -447,10 +694,16 @@ export async function runPlan(db: Db, job: PlanJob, deps: AgentDeps) {
       }
       const [plan] = await tx
         .insert(testPlans)
-        .values({ projectId: job.projectId, taskId: job.taskId, name: drafted.plan.name, version: (prev?.version ?? 0) + 1, status: "draft", body: { summary: drafted.plan.summary, scope: drafted.plan.scope, outOfScope: drafted.plan.outOfScope, risks: drafted.plan.risks, critical: drafted.plan.critical, gaps }, sourceIds })
+        .values({ projectId: job.projectId, trackId: track.id, taskId: job.taskId, name: drafted.plan.name, version: (prev?.version ?? 0) + 1, status: "draft", body: { summary: drafted.plan.summary, scope: drafted.plan.scope, outOfScope: drafted.plan.outOfScope, risks: drafted.plan.risks, critical: drafted.plan.critical, gaps }, sourceIds })
         .returning();
       const storyIds = new Map<string, string>();
-      for (const [i, st] of drafted.stories.entries()) {
+      for (const [i, st] of approvedStories.entries()) {
+        const { id: _id, planId: _plan, position: _pos, ...rest } = st;
+        const [row] = await tx.insert(userStories).values({ ...rest, planId: plan!.id, position: i }).returning({ id: userStories.id });
+        storyIds.set(keptRefOfStory.get(st.id)!, row!.id);
+      }
+      for (const [j, st] of drafted.stories.entries()) {
+        const i = approvedStories.length + j;
         const [row] = await tx
           .insert(userStories)
           .values({
@@ -471,8 +724,17 @@ export async function runPlan(db: Db, job: PlanJob, deps: AgentDeps) {
         storyIds.set(st.ref, row!.id);
       }
       let cases = 0;
-      for (const [i, s] of ordered.entries()) {
-        const [scen] = await tx.insert(scenarios).values({ planId: plan!.id, key: keyOf("SC", sc++, 3), storyId: s.storyRef ? (storyIds.get(s.storyRef) ?? null) : null, title: s.title, actor: s.actor, situation: s.situation, outcome: s.outcome, priority: s.priority, kind: s.kind, requirementIds: s.requirementKeys, position: i }).returning();
+      for (const [i, e] of ordered.entries()) {
+        const storyId = e.storyRef ? (storyIds.get(e.storyRef) ?? null) : null;
+        if (e.kind === "kept") {
+          // Same scenario (same SC number) in the new plan; its approved test cases move across with their ids and numbers.
+          const { id: _id, planId: _plan, position: _pos, storyId: _story, ...rest } = e.row;
+          const [scen] = await tx.insert(scenarios).values({ ...rest, key: rest.key ?? keyOf("SC", sc++, 3), planId: plan!.id, storyId, position: i }).returning({ id: scenarios.id });
+          await tx.update(testCases).set({ scenarioId: scen!.id }).where(inArray(testCases.id, e.cases.map((c) => c.id)));
+          continue;
+        }
+        const s = e.draft;
+        const [scen] = await tx.insert(scenarios).values({ planId: plan!.id, key: keyOf("SC", sc++, 3), storyId, title: s.title, actor: s.actor, situation: s.situation, outcome: s.outcome, priority: s.priority, kind: s.kind, requirementIds: s.requirementKeys, position: i }).returning();
         await tx.insert(testCases).values(
           s.testCases.map((c) => ({
             scenarioId: scen!.id,
@@ -492,9 +754,11 @@ export async function runPlan(db: Db, job: PlanJob, deps: AgentDeps) {
     });
 
     await finish(db, job.taskId, job.runId, "done", usage, {
+      plan: track.name,
       requirements: reqs.length,
       scenarios: drafted.scenarios.length,
       testCases: caseCount,
+      ...(kept.stories.length || approvedRows.length ? { kept: { stories: kept.stories.length, scenarios: keptScenarios.size, testCases: [...keptScenarios.values()].reduce((n, x) => n + x.cases.length, 0) } } : {}),
       passages: chunks.length,
       stories: drafted.stories.length,
       critical: drafted.plan.critical.length,

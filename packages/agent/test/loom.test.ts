@@ -79,6 +79,28 @@ describe("fetchLoomTranscript", () => {
     }
   });
 
+  it("asks only for the transcript links, and keeps Loom's reason when it rejects the query", async () => {
+    const { f, calls } = fakeFetch({
+      "https://www.loom.com/graphql": () =>
+        new Response(JSON.stringify({ errors: [{ message: 'Cannot query field "id" on type "VideoTranscriptDetails".', extensions: { code: "GRAPHQL_VALIDATION_FAILED" } }] }), { status: 400 }),
+    });
+    await expect(fetchLoomTranscript(LINK, f)).rejects.toThrow(`Loom didn't return a transcript (HTTP 400: Cannot query field "id" on type "VideoTranscriptDetails".)`);
+    const query = (calls.find((c) => c.url === "https://www.loom.com/graphql")!.body as { query: string }).query;
+    expect(query).toContain("... on VideoTranscriptDetails { source_url captions_source_url }");
+  });
+
+  it("reads Loom's captions as served today: Windows line endings and numbered speakers", async () => {
+    // The shape Loom returned for a real public video (Nov 2026), shortened.
+    const served = "WEBVTT\r\n\r\n1\r\n00:00:00.011 --> 00:00:02.228\r\n<v 0>Hey guys,</v>\r\n\r\n2\r\n00:00:02.238 --> 00:00:05.927\r\njust to give you a little update.\r\n\r\n3\r\n00:00:06.000 --> 00:00:08.000\r\n<v Sam Lee>Over to me.</v>\r\n";
+    const { f } = fakeFetch({
+      "https://www.loom.com/graphql": () => json({ data: { fetchVideoTranscript: { video_id: ID, source_url: null, captions_source_url: "https://cdn.loom.test/c.vtt" } } }),
+      "https://cdn.loom.test/c.vtt": () => new Response(served),
+    });
+    const t = await fetchLoomTranscript(LINK, f);
+    expect(t.cues.map((c) => c.text)).toEqual(["Hey guys,", "just to give you a little update.", "Sam Lee: Over to me."]);
+    expect(t.cues[0]).toMatchObject({ start: 0.011, end: 2.228 });
+  });
+
   it("reads phrase lists defensively", () => {
     expect(phrasesToCues(null)).toEqual([]);
     expect(phrasesToCues({ phrases: [{ ts: "x", value: "bad" }, { ts: 3, value: "  " }, { start: 1, text: "ok" }] })).toEqual([{ start: 1, end: 6, text: "ok" }]);

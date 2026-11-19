@@ -2,12 +2,12 @@
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { asc, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { confluencePageUrl, type PlanJob } from "@mattertest/core";
-import { clientQuestions, clients, createDb, projects, requirements, runs, scenarios, sourceChunks, sources, tasks, testCases, testPlans, userStories, type Db } from "@mattertest/db";
+import { clientQuestions, clients, createDb, planTracks, projects, requirements, runs, scenarios, sourceChunks, sources, tasks, testCases, testPlans, userStories, type Db } from "@mattertest/db";
 import { Extraction, NOT_SET_UP, PlanDraft, type ConfluenceConfig, type Embedder, type StructuredModel } from "@mattertest/agent";
-import { runConfluence, runIngest, runPlan, type AgentDeps } from "../src/agent";
+import { runConfluence, runIngest, runPlan, runTrack, type AgentDeps } from "../src/agent";
 
 const hasDb = !!process.env.DATABASE_URL;
 const db = hasDb ? createDb() : (undefined as never);
@@ -35,6 +35,7 @@ async function removeProject(d: Db, projectId: string, clientId: string) {
     const t = await tx.select({ id: tasks.id }).from(tasks).where(eq(tasks.projectId, projectId));
     if (t.length) await tx.delete(runs).where(inArray(runs.taskId, t.map((x) => x.id)));
     await tx.delete(tasks).where(eq(tasks.projectId, projectId));
+    await tx.delete(planTracks).where(eq(planTracks.projectId, projectId));
     await tx.delete(projects).where(eq(projects.id, projectId));
     await tx.delete(clients).where(eq(clients.id, clientId));
   });
@@ -127,7 +128,7 @@ describe.skipIf(!hasDb)("agent jobs", () => {
     await runPlan(db, planned[0]!, deps([]));
     const [plan] = await db.select().from(testPlans).where(eq(testPlans.projectId, projectId));
     expect(plan).toMatchObject({ version: 1, status: "draft", sourceIds: [job.sourceId] });
-    const scen = await db.select().from(scenarios).where(eq(scenarios.planId, plan!.id));
+    const scen = await db.select().from(scenarios).where(eq(scenarios.planId, plan!.id)).orderBy(asc(scenarios.position));
     expect(scen.map((s) => s.requirementIds)).toEqual([["REQ-01"], ["REQ-02"]]);
     expect(scen[0]).toMatchObject({ actor: "Guest shopper", situation: "Meets REQ-01 at checkout", outcome: "The order goes through" });
     expect(plan!.body).toMatchObject({ critical: [], gaps: [] });
@@ -152,6 +153,10 @@ describe.skipIf(!hasDb)("agent jobs", () => {
     await runIngest(db, { ...v2, thenPlan: true }, deps(planned2));
     const [old] = await db.select().from(sources).where(eq(sources.id, job.sourceId));
     expect(old!.status).toBe("superseded");
+    // The old version's open question is withdrawn; the new version asks its own.
+    const qs = await db.select({ sourceId: clientQuestions.sourceId, status: clientQuestions.status }).from(clientQuestions).where(eq(clientQuestions.projectId, projectId));
+    expect(qs.filter((q) => q.sourceId === job.sourceId).map((q) => q.status)).toEqual(["withdrawn"]);
+    expect(qs.filter((q) => q.sourceId === v2.sourceId).map((q) => q.status)).toEqual(["open"]);
     const all = await db.select().from(requirements).where(eq(requirements.projectId, projectId)).orderBy(asc(requirements.key));
     expect(all.map((r) => [r.key, r.reviewState])).toEqual([["REQ-01", "superseded"], ["REQ-02", "superseded"], ["REQ-03", "needs-review"], ["REQ-04", "needs-review"]]);
     await runPlan(db, planned2[0]!, deps([]));
@@ -164,6 +169,77 @@ describe.skipIf(!hasDb)("agent jobs", () => {
     expect(scen.map((x) => x.key)).toEqual(["SC-001", "SC-002"]);
     expect(newScen.map((x) => x.key).sort()).toEqual(["SC-002", "SC-003"]);
     expect((await db.select({ key: userStories.key }).from(userStories).where(eq(userStories.planId, plans[1]!.id))).map((x) => x.key)).toEqual(["US-01"]);
+  });
+
+  it("starts a second test plan on the same source with its own focus, leaving the first one as it was", async () => {
+    const projectId = await setup();
+    mkdirSync(join(artefacts, "sources", projectId), { recursive: true });
+    writeFileSync(join(artefacts, "sources", projectId, "brief.md"), brief);
+    const job = await addSource(projectId, { fileUri: `sources/${projectId}/brief.md` });
+    const planned: PlanJob[] = [];
+    await runIngest(db, { ...job, thenPlan: true }, deps(planned));
+    const [first] = await db.select().from(planTracks).where(eq(planTracks.projectId, projectId));
+    expect(first).toMatchObject({ number: 1, name: "Test plan", focus: null, sourceIds: null });
+    expect(planned).toEqual([expect.objectContaining({ trackId: first!.id })]);
+    await runPlan(db, planned[0]!, deps([]));
+    const [planA] = await db.select().from(testPlans).where(eq(testPlans.trackId, first!.id));
+
+    const [second] = await db.insert(planTracks).values({ projectId, number: 2, name: "Shipping", focus: "Shipping rates only", position: 1 }).returning();
+    const [t] = await db.insert(tasks).values({ projectId, kind: "plan", title: "Start test plan" }).returning();
+    const [r] = await db.insert(runs).values({ taskId: t!.id }).returning();
+    const prompts: string[] = [];
+    const spy: StructuredModel = async (req) => {
+      prompts.push(req.user);
+      return model(req);
+    };
+    const next: PlanJob[] = [];
+    await runTrack(db, { taskId: t!.id, runId: r!.id, projectId, trackId: second!.id }, { ...deps(next), model: spy });
+    expect(prompts[0]).toContain('<plan_focus plan="Shipping">\nShipping rates only\n</plan_focus>');
+    const reqsB = await db.select().from(requirements).where(eq(requirements.trackId, second!.id)).orderBy(asc(requirements.key));
+    expect(reqsB.map((x) => x.key)).toEqual(["REQ-01", "REQ-02"]); // numbered within the plan (TP2-REQ-01)
+    expect(await db.select().from(clientQuestions).where(eq(clientQuestions.trackId, second!.id))).toHaveLength(1);
+    expect(next).toEqual([expect.objectContaining({ trackId: second!.id })]);
+
+    await runPlan(db, next[0]!, { ...deps([]), model: spy });
+    expect(prompts.at(-1)).toContain("<plan_focus");
+    expect(prompts.at(-1)).toContain('key="REQ-01"');
+    expect(prompts.at(-1)).toContain('<requirements count="2">'); // only this plan's requirements
+    const [planB] = await db.select().from(testPlans).where(eq(testPlans.trackId, second!.id));
+    expect(planB).toMatchObject({ version: 1, status: "draft" });
+    // Each plan numbers its own work from 1; the first plan's draft is untouched.
+    const [stillA] = await db.select().from(testPlans).where(eq(testPlans.id, planA!.id));
+    expect(stillA!.status).toBe("draft");
+    expect(second!.number).toBe(2);
+    const casesB = await db.select({ key: testCases.key }).from(testCases).innerJoin(scenarios, eq(scenarios.id, testCases.scenarioId)).where(eq(scenarios.planId, planB!.id)).orderBy(asc(testCases.key));
+    expect(casesB.map((c) => c.key)).toEqual(["TC-001", "TC-002"]);
+    const storiesB = await db.select({ key: userStories.key }).from(userStories).where(eq(userStories.planId, planB!.id));
+    expect(storiesB.map((x) => x.key)).toEqual(["US-01"]);
+    const scenB = await db.select({ key: scenarios.key }).from(scenarios).where(eq(scenarios.planId, planB!.id)).orderBy(asc(scenarios.position));
+    expect(scenB.map((x) => x.key)).toEqual(["SC-001", "SC-002"]);
+
+    // Re-drafting the second plan only replaces the second plan's draft.
+    const [t2] = await db.insert(tasks).values({ projectId, kind: "plan", title: "Draft" }).returning();
+    const [r2] = await db.insert(runs).values({ taskId: t2!.id }).returning();
+    await runPlan(db, { taskId: t2!.id, runId: r2!.id, projectId, trackId: second!.id }, deps([]));
+    expect((await db.select().from(testPlans).where(eq(testPlans.id, planA!.id)))[0]!.status).toBe("draft");
+    const versionsB = await db.select({ v: testPlans.version, s: testPlans.status }).from(testPlans).where(eq(testPlans.trackId, second!.id)).orderBy(asc(testPlans.version));
+    expect(versionsB).toEqual([{ v: 1, s: "superseded" }, { v: 2, s: "draft" }]);
+
+    // A new focus reads the plan afresh: requirements from sources it no longer reads go, and numbering restarts at 01.
+    await db.insert(requirements).values({ projectId, trackId: second!.id, key: "REQ-03", title: "From a dropped source", text: "x" });
+    await db.update(planTracks).set({ focus: "Shipping rates and delivery times" }).where(eq(planTracks.id, second!.id));
+    const [t3] = await db.insert(tasks).values({ projectId, kind: "plan", title: "Read again" }).returning();
+    const [r3] = await db.insert(runs).values({ taskId: t3!.id }).returning();
+    const again: PlanJob[] = [];
+    prompts.length = 0;
+    await runTrack(db, { taskId: t3!.id, runId: r3!.id, projectId, trackId: second!.id, reset: true }, { ...deps(again), model: spy });
+    expect(prompts[0]).toContain("Shipping rates and delivery times");
+    const reread = await db.select({ key: requirements.key }).from(requirements).where(eq(requirements.trackId, second!.id)).orderBy(asc(requirements.key));
+    expect(reread.map((x) => x.key)).toEqual(["REQ-01", "REQ-02"]);
+    expect(await db.select().from(clientQuestions).where(eq(clientQuestions.trackId, second!.id))).toHaveLength(1);
+    expect(again).toEqual([expect.objectContaining({ trackId: second!.id })]);
+    // The first plan is untouched.
+    expect((await db.select().from(requirements).where(eq(requirements.trackId, first!.id))).length).toBeGreaterThan(0);
   });
 
   it("parks a Loom source that has no public transcript, then reads an attached one", async () => {
@@ -220,7 +296,9 @@ describe.skipIf(!hasDb)("agent jobs", () => {
     const children: Record<string, { id: string; type: string; title: string; status: string }[]> = {
       "100": [{ id: "101", type: "page", title: "Shipping rules", status: "current" }, { id: "900", type: "folder", title: "Archive", status: "current" }],
       "900": [{ id: "102", type: "page", title: "Old notes", status: "current" }],
+      "800": [{ id: "100", type: "page", title: "Checkout v2", status: "current" }, { id: "101", type: "page", title: "Shipping rules", status: "current" }],
     };
+    const folders: Record<string, string> = { "900": "Archive", "800": "Requirements" };
     const confluenceFetch = (async (input: string | URL | Request) => {
       const url = new URL(String(input));
       const page = url.pathname.match(/^\/wiki\/api\/v2\/pages\/(\d+)$/);
@@ -231,6 +309,8 @@ describe.skipIf(!hasDb)("agent jobs", () => {
       }
       const kids = url.pathname.match(/^\/wiki\/api\/v2\/(?:pages|folders)\/(\d+)\/direct-children$/);
       if (kids) return json({ results: children[kids[1]!] ?? [], _links: {} });
+      const folder = url.pathname.match(/^\/wiki\/api\/v2\/folders\/(\d+)$/);
+      if (folder) return folders[folder[1]!] ? json({ id: folder[1], title: folders[folder[1]!] }) : json({}, 404);
       return json({}, 404);
     }) as typeof fetch;
 
@@ -251,9 +331,9 @@ describe.skipIf(!hasDb)("agent jobs", () => {
       await runConfluence(db, job, confDeps(planned));
 
       expect(await live(projectId)).toEqual([["Checkout v2", 1, "ready"], ["Old notes", 1, "ready"], ["Shipping rules", 1, "ready"]]);
-      const [root] = await db.select().from(sources).where(eq(sources.uri, confluencePageUrl(ORIGIN, "100")));
-      expect(root!.meta.confluence).toEqual({ pageId: "100", version: 3, webUrl: `${ORIGIN}/wiki/spaces/SHOP/pages/100`, rootPageId: "100", includeChildren: true });
-      const [child] = await db.select().from(sources).where(eq(sources.uri, confluencePageUrl(ORIGIN, "102")));
+      const [root] = await db.select().from(sources).where(and(eq(sources.projectId, projectId), eq(sources.uri, confluencePageUrl(ORIGIN, "100"))));
+      expect(root!.meta.confluence).toEqual({ pageId: "100", version: 3, webUrl: `${ORIGIN}/wiki/spaces/SHOP/pages/100`, rootPageId: "100", includeChildren: true, rootTitle: "Checkout v2" });
+      const [child] = await db.select().from(sources).where(and(eq(sources.projectId, projectId), eq(sources.uri, confluencePageUrl(ORIGIN, "102"))));
       expect(child!.meta.confluence).toMatchObject({ pageId: "102", rootPageId: "100" });
       expect(child!.meta.confluence?.includeChildren).toBeUndefined();
 
@@ -276,6 +356,9 @@ describe.skipIf(!hasDb)("agent jobs", () => {
       expect((await runOf(noChange.runId)).summary).toMatchObject({ pages: 3, added: 0, changed: 0, unchanged: 3 });
       expect(quiet).toHaveLength(0);
 
+      // The team removes "Old notes"; a later change to it in Confluence doesn't bring it back.
+      await db.update(sources).set({ status: "removed" }).where(and(eq(sources.projectId, projectId), eq(sources.uri, confluencePageUrl(ORIGIN, "102"))));
+      pages["102"]!.version = 2;
       const saved = { ...pages["101"]! };
       pages["101"] = { ...saved, version: 2, html: saved.html + "<p>Express shipping costs $14.95.</p>" };
       children["900"]!.push({ id: "103", type: "page", title: "New page", status: "current" });
@@ -285,15 +368,44 @@ describe.skipIf(!hasDb)("agent jobs", () => {
         const sync = await confluenceJob(projectId, { sync: true });
         await runConfluence(db, sync, confDeps(planned));
         expect((await runOf(sync.runId)).summary).toMatchObject({ pages: 4, added: 1, changed: 1, unchanged: 2 });
-        expect(await live(projectId)).toEqual([["Checkout v2", 1, "ready"], ["New page", 1, "ready"], ["Old notes", 1, "ready"], ["Shipping rules", 1, "superseded"], ["Shipping rules", 2, "ready"]]);
+        expect(await live(projectId)).toEqual([["Checkout v2", 1, "ready"], ["New page", 1, "ready"], ["Old notes", 1, "removed"], ["Shipping rules", 1, "superseded"], ["Shipping rules", 2, "ready"]]);
         const states = await db.select({ key: requirements.key, state: requirements.reviewState, sourceId: requirements.sourceId }).from(requirements).where(eq(requirements.projectId, projectId));
         expect(states.filter((r) => r.state === "superseded")).toHaveLength(1);
         expect(planned).toHaveLength(1);
       } finally {
         pages["101"] = saved;
+        pages["102"]!.version = 1;
         children["900"]!.pop();
         delete pages["103"];
       }
+    });
+
+    it("adds a folder: every page in it, including one the team had removed, and update checks read the folder again", async () => {
+      const projectId = await setup();
+      await runConfluence(db, await confluenceJob(projectId, { link: `${ORIGIN}/wiki/spaces/SHOP/pages/100` }), confDeps([]));
+      await db.update(sources).set({ status: "removed" }).where(and(eq(sources.projectId, projectId), eq(sources.uri, confluencePageUrl(ORIGIN, "100"))));
+
+      const planned: PlanJob[] = [];
+      const job = await confluenceJob(projectId, { link: `${ORIGIN}/wiki/spaces/SHOP/folder/800`, includeChildren: true });
+      await runConfluence(db, job, confDeps(planned));
+      expect((await runOf(job.runId)).summary).toMatchObject({ pages: 3, added: 3, changed: 0, failed: 0 }); // page 100's own child pages come too
+      expect(await live(projectId)).toEqual([["Checkout v2", 1, "superseded"], ["Checkout v2", 2, "ready"], ["Old notes", 1, "ready"], ["Shipping rules", 1, "ready"]]);
+      const [readded] = await db.select().from(sources).where(and(eq(sources.projectId, projectId), eq(sources.uri, confluencePageUrl(ORIGIN, "100")), eq(sources.version, 2)));
+      expect(readded!.meta.confluence).toMatchObject({ pageId: "100", rootPageId: "800", rootKind: "folder" });
+      expect(planned).toHaveLength(1);
+
+      const sync = await confluenceJob(projectId, { sync: true });
+      await runConfluence(db, sync, confDeps([]));
+      expect((await runOf(sync.runId)).summary).toMatchObject({ pages: 3, added: 0, changed: 0, unchanged: 3 });
+
+      const empty = await confluenceJob(projectId, { link: `${ORIGIN}/wiki/spaces/SHOP/folder/900` });
+      children["900"]!.length = 0;
+      try {
+        await runConfluence(db, empty, confDeps([]));
+      } finally {
+        children["900"]!.push({ id: "102", type: "page", title: "Old notes", status: "current" });
+      }
+      expect(await runOf(empty.runId)).toMatchObject({ status: "failed", summary: { error: 'The folder "Archive" has no pages in it.' } });
     });
 
     it("fails the run with a plain message when Confluence isn't set up or can't open the page", async () => {
@@ -362,5 +474,57 @@ describe.skipIf(!hasDb)("agent jobs", () => {
     expect(scen.map((x) => [x.key, x.title])).toEqual([["SC-001", "For S1"], ["SC-002", "For S2"]]);
     const cases = await db.select().from(testCases).where(inArray(testCases.scenarioId, scen.map((x) => x.id))).orderBy(asc(testCases.key));
     expect(cases.map((c) => [c.key, c.title])).toEqual([["TC-001", "Case S1"], ["TC-002", "Case S2"]]);
+  });
+
+  it("keeps approved stories and test cases through a re-draft, and tells Claude not to redraft them", async () => {
+    const projectId = await setup();
+    mkdirSync(join(artefacts, "sources", projectId), { recursive: true });
+    writeFileSync(join(artefacts, "sources", projectId, "k.md"), brief);
+    const job = await addSource(projectId, { fileUri: `sources/${projectId}/k.md` });
+    const planned: PlanJob[] = [];
+    await runIngest(db, { ...job, thenPlan: true }, deps(planned));
+    await runPlan(db, planned[0]!, deps([]));
+    const [v1] = await db.select().from(testPlans).where(eq(testPlans.projectId, projectId));
+    const [story] = await db.select().from(userStories).where(eq(userStories.planId, v1!.id));
+    const v1Scen = await db.select().from(scenarios).where(eq(scenarios.planId, v1!.id)).orderBy(asc(scenarios.position));
+    const [approvedCase] = await db.select().from(testCases).where(eq(testCases.scenarioId, v1Scen[0]!.id));
+    await db.update(userStories).set({ reviewState: "approved", reviewedBy: "qa@matterdesign.com.au" }).where(eq(userStories.id, story!.id));
+    await db.update(testCases).set({ reviewState: "approved" }).where(eq(testCases.id, approvedCase!.id));
+
+    // Re-draft: the model sees the approved work and drafts only REQ-02's scenario (REQ-01 is covered by the kept one).
+    const seen: string[] = [];
+    const redraft: StructuredModel = async (req) => {
+      seen.push(req.user);
+      if (req.schema !== (PlanDraft as unknown)) return model(req);
+      const ref = req.user.match(/<requirement key="REQ-02"[^>]*passages="(c\d+)/)![1]!;
+      const data = PlanDraft.parse({
+        name: "v2", summary: "s", scope: [], outOfScope: [], risks: [], criticalRequirements: [], stories: [],
+        scenarios: [{ storyRef: "A1", title: "New for REQ-02", actor: "a", situation: "s", outcome: "o", priority: "P2", kind: "happy", requirementKeys: ["REQ-02"], testCases: [{ title: "New case", preconditions: "", testData: "", steps: [{ action: "a", expected: "e" }], automationCandidate: false, chunkIds: [ref] }] }],
+      });
+      return { data: data as never, usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 0 }, model: "claude-opus-5-5" };
+    };
+    const [t] = await db.insert(tasks).values({ projectId, kind: "plan", title: "Draft test plan" }).returning();
+    const [r] = await db.insert(runs).values({ taskId: t!.id }).returning();
+    await runPlan(db, { taskId: t!.id, runId: r!.id, projectId }, { model: redraft, embedder: null, queuePlan: async () => {} });
+
+    expect(seen[0]).toContain("Already approved by the team");
+    expect(seen[0]).toContain(`- A1 (${story!.key}): ${story!.title}.`);
+    expect(seen[0]).toContain(`${approvedCase!.key} ${approvedCase!.title}`);
+    expect(seen).toHaveLength(1); // the kept scenario already covers REQ-01, so no follow-up call
+    const [v2] = await db.select().from(testPlans).where(and(eq(testPlans.projectId, projectId), eq(testPlans.status, "draft")));
+    const v2Stories = await db.select().from(userStories).where(eq(userStories.planId, v2!.id));
+    expect(v2Stories.map((x) => [x.key, x.reviewState, x.reviewedBy])).toEqual([[story!.key, "approved", "qa@matterdesign.com.au"]]);
+    const v2Scen = await db.select().from(scenarios).where(eq(scenarios.planId, v2!.id)).orderBy(asc(scenarios.position));
+    expect(v2Scen.map((x) => [x.key, x.title, x.storyId])).toEqual([
+      [v1Scen[0]!.key, v1Scen[0]!.title, v2Stories[0]!.id],
+      ["SC-002", "New for REQ-02", v2Stories[0]!.id],
+    ]);
+    // The approved case moved across: same row, same number, still approved.
+    const [moved] = await db.select().from(testCases).where(eq(testCases.id, approvedCase!.id));
+    expect(moved).toMatchObject({ scenarioId: v2Scen[0]!.id, key: approvedCase!.key, reviewState: "approved" });
+    const fresh = await db.select().from(testCases).where(eq(testCases.scenarioId, v2Scen[1]!.id));
+    expect(fresh.map((c) => c.key)).toEqual(["TC-002"]);
+    const [run] = await db.select().from(runs).where(eq(runs.id, r!.id));
+    expect(run!.summary).toMatchObject({ kept: { stories: 1, scenarios: 1, testCases: 1 } });
   });
 });

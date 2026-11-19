@@ -76,11 +76,23 @@ type PageResponse = {
   _links?: { webui?: string; base?: string };
 };
 
+export type ConfluenceRoot = { kind: "page" | "folder"; id: string };
+
+/** The page or folder a link points at, resolving short links (/wiki/x/…) by following their redirect. */
+export async function resolveRoot(cfg: ConfluenceConfig, link: string, f: Fetch = fetch): Promise<ConfluenceRoot> {
+  const ref = confluencePageRef(link);
+  if (!ref) throw new ConfluenceError("That isn't a Confluence page or folder link. Copy the link from the address bar.");
+  if (ref.origin !== cfg.origin) throw new ConfluenceError(`MatterTest reads Confluence at ${cfg.origin}, but this link is on ${ref.origin}.`);
+  if ("folderId" in ref) return { kind: "folder", id: ref.folderId };
+  return { kind: "page", id: await resolvePageId(cfg, link, f) };
+}
+
 /** The page's id from a link, resolving short links (/wiki/x/…) by following their redirect. */
 export async function resolvePageId(cfg: ConfluenceConfig, link: string, f: Fetch = fetch): Promise<string> {
   const ref = confluencePageRef(link);
   if (!ref) throw new ConfluenceError("That isn't a Confluence page link. Copy the link from the page's address bar.");
   if (ref.origin !== cfg.origin) throw new ConfluenceError(`MatterTest reads Confluence at ${cfg.origin}, but this link is on ${ref.origin}.`);
+  if ("folderId" in ref) throw new ConfluenceError("That's a folder link, not a page link.");
   if ("pageId" in ref) return ref.pageId;
   let res: Response;
   try {
@@ -121,20 +133,28 @@ async function directChildren(cfg: ConfluenceConfig, kind: "pages" | "folders", 
   return out;
 }
 
+/** A folder's title. */
+export async function fetchFolderTitle(cfg: ConfluenceConfig, folderId: string, f: Fetch = fetch): Promise<string> {
+  const folder = await getJson<{ title?: string }>(cfg, `/wiki/api/v2/folders/${encodeURIComponent(folderId)}`, f, `folder ${folderId}`);
+  return folder.title || `Folder ${folderId}`;
+}
+
 /**
- * A page and, if asked, the pages under it (breadth first, through folders), up to `max` pages in all.
- * Returns the pages and whether the cap cut the tree short.
+ * A page and, if asked, the pages under it (breadth first, through folders), up to `max` pages in all. With
+ * `folder`, the root is a folder: every page in it (and under those) is read, and there's no root page.
+ * Returns the pages, the root's title and whether the cap cut the tree short.
  */
 export async function readPageTree(
   cfg: ConfluenceConfig,
   rootId: string,
-  opts: { includeChildren: boolean; max?: number },
+  opts: { includeChildren: boolean; max?: number; folder?: boolean },
   f: Fetch = fetch,
-): Promise<{ pages: ConfluencePage[]; truncated: boolean }> {
+): Promise<{ pages: ConfluencePage[]; truncated: boolean; rootTitle: string }> {
   const max = opts.max ?? CONFLUENCE_MAX_PAGES;
-  const pages = [await fetchPage(cfg, rootId, f)];
-  if (!opts.includeChildren) return { pages, truncated: false };
-  const queue: { kind: "pages" | "folders"; id: string; parentId: string }[] = [{ kind: "pages", id: rootId, parentId: rootId }];
+  const pages: ConfluencePage[] = opts.folder ? [] : [await fetchPage(cfg, rootId, f)];
+  const rootTitle = opts.folder ? await fetchFolderTitle(cfg, rootId, f) : pages[0]!.title;
+  if (!opts.includeChildren && !opts.folder) return { pages, truncated: false, rootTitle };
+  const queue: { kind: "pages" | "folders"; id: string; parentId: string }[] = [{ kind: opts.folder ? "folders" : "pages", id: rootId, parentId: rootId }];
   const seen = new Set([rootId]);
   while (queue.length) {
     const at = queue.shift()!;
@@ -146,10 +166,10 @@ export async function readPageTree(
         continue;
       }
       if (c.type && c.type !== "page") continue; // whiteboards, databases, embeds
-      if (pages.length >= max) return { pages, truncated: true };
+      if (pages.length >= max) return { pages, truncated: true, rootTitle };
       pages.push({ ...(await fetchPage(cfg, c.id, f)), parentId: at.parentId });
       queue.push({ kind: "pages", id: c.id, parentId: c.id });
     }
   }
-  return { pages, truncated: false };
+  return { pages, truncated: false, rootTitle };
 }

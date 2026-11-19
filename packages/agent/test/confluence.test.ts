@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { confluencePageRef, confluencePageUrl } from "@mattertest/core";
-import { ConfluenceError, confluenceConfigFromEnv, fetchPage, readPageTree, resolvePageId, type ConfluenceConfig } from "../src/confluence";
+import { ConfluenceError, confluenceConfigFromEnv, fetchPage, readPageTree, resolvePageId, resolveRoot, type ConfluenceConfig } from "../src/confluence";
 import { parseHtml } from "../src/parse";
 import { readSource } from "../src/pipeline";
 
@@ -10,7 +10,7 @@ const cfg: ConfluenceConfig = { origin: ORIGIN, email: "qa@matterdesign.com.au",
 const json = (j: unknown, status = 200) => new Response(JSON.stringify(j), { status, headers: { "content-type": "application/json" } });
 
 /** A fake Confluence: pages by id, children by parent id (pages or folders), optional page size for pagination. */
-function fakeConfluence(opts: { pages: Record<string, { title: string; version?: number; html?: string }>; children?: Record<string, { id: string; title?: string; type?: string; status?: string }[]>; pageSize?: number; status?: number }) {
+function fakeConfluence(opts: { pages: Record<string, { title: string; version?: number; html?: string }>; folders?: Record<string, string>; children?: Record<string, { id: string; title?: string; type?: string; status?: string }[]>; pageSize?: number; status?: number }) {
   const calls: { url: string; auth: string | null }[] = [];
   const f = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = new URL(String(input));
@@ -22,6 +22,8 @@ function fakeConfluence(opts: { pages: Record<string, { title: string; version?:
       if (!p) return json({ errors: [] }, 404);
       return json({ id: page[1], title: p.title, version: { number: p.version ?? 1 }, body: { export_view: { value: p.html ?? `<p>${p.title}</p>` } }, _links: { webui: `/spaces/SHOP/pages/${page[1]}/${encodeURIComponent(p.title)}`, base: `${ORIGIN}/wiki` } });
     }
+    const folder = url.pathname.match(/^\/wiki\/api\/v2\/folders\/(\d+)$/);
+    if (folder) return opts.folders?.[folder[1]!] ? json({ id: folder[1], title: opts.folders[folder[1]!] }) : json({ errors: [] }, 404);
     const kids = url.pathname.match(/^\/wiki\/api\/v2\/(?:pages|folders)\/(\d+)\/direct-children$/);
     if (kids) {
       const all = opts.children?.[kids[1]!] ?? [];
@@ -43,6 +45,8 @@ describe("confluencePageRef", () => {
     expect(confluencePageRef(`${ORIGIN}/wiki/pages/viewpage.action?pageId=123456`)).toEqual({ origin: ORIGIN, pageId: "123456" });
     expect(confluencePageRef(`${ORIGIN}/wiki/spaces/SHOP/pages/123456/Checkout+v2#Promo-codes`)).toEqual({ origin: ORIGIN, pageId: "123456" });
     expect(confluencePageRef(`${ORIGIN}/wiki/x/AbCd12`)).toEqual({ origin: ORIGIN, tiny: "AbCd12" });
+    expect(confluencePageRef(`${ORIGIN}/wiki/spaces/DEBRA/folder/3270279171`)).toEqual({ origin: ORIGIN, folderId: "3270279171" });
+    expect(confluencePageRef(`${ORIGIN}/wiki/spaces/DEBRA/folder/3270279171?atlOrigin=abc`)).toEqual({ origin: ORIGIN, folderId: "3270279171" });
   });
 
   it("rejects links that aren't to a page", () => {
@@ -119,6 +123,19 @@ describe("reading pages", () => {
     const { pages, truncated } = await readPageTree(cfg, "100", { includeChildren: true }, f);
     expect(pages.map((p) => [p.id, p.parentId])).toEqual([["100", undefined], ["101", "100"], ["103", "100"], ["104", "101"], ["102", "100"]]);
     expect(truncated).toBe(false);
+  });
+
+  it("reads every page in a folder, including pages under those, with no root page", async () => {
+    const { f } = fakeConfluence({
+      pages: { "101": { title: "Booking" }, "102": { title: "Pickup" }, "104": { title: "Booking detail" } },
+      folders: { "900": "Requirements" },
+      children: { "900": [{ id: "101" }, { id: "901", type: "folder" }], "901": [{ id: "102" }], "101": [{ id: "104" }] },
+    });
+    const out = await readPageTree(cfg, "900", { includeChildren: false, folder: true }, f);
+    expect(out.rootTitle).toBe("Requirements");
+    expect(out.pages.map((p) => [p.id, p.parentId])).toEqual([["101", "900"], ["104", "101"], ["102", "900"]]);
+    expect(await resolveRoot(cfg, `${ORIGIN}/wiki/spaces/DEBRA/folder/900`, f)).toEqual({ kind: "folder", id: "900" });
+    expect(await resolveRoot(cfg, `${ORIGIN}/wiki/spaces/DEBRA/pages/42/T`, f)).toEqual({ kind: "page", id: "42" });
   });
 
   it("stops at the page cap and says so", async () => {

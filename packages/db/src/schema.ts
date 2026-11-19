@@ -86,6 +86,10 @@ export type ConfluenceSourceMeta = {
   rootPageId: string;
   /** On the added page only: whether its child pages are read too. */
   includeChildren?: boolean;
+  /** "folder" when the team added a folder: rootPageId is the folder's id, and every page in it is read. */
+  rootKind?: "folder";
+  /** Title of the folder or page the team added, for grouping its pages on Test assets. */
+  rootTitle?: string;
 };
 
 export type SourceMeta = {
@@ -98,6 +102,9 @@ export type SourceMeta = {
   confluence?: ConfluenceSourceMeta;
   /** What the team told the agent about this source when adding it ("old v1 brief, only section 4 still applies"). */
   note?: string;
+  /** Set while a source is removed: the status to go back to on restore. */
+  removedFrom?: string;
+  removedBy?: string;
 };
 
 export const sources = pgTable(
@@ -147,12 +154,37 @@ const reviewed = () => ({
   reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
 });
 
+/**
+ * A test plan the team set up in a project, on its own topic ("Booking", "Click and collect"). It has its own
+ * requirements (read from its sources with its focus), drafted versions (test_plans), review and coverage.
+ */
+export const planTracks = pgTable(
+  "plan_tracks",
+  {
+  id: id(),
+  projectId: uuid("project_id").notNull().references(() => projects.id),
+  /** Test plan number in the project (TP1, TP2…), never reused. Prefixes its IDs on screen: TP1-REQ-01, TP1-TC-004. */
+  number: integer("number").notNull().default(1),
+  name: text("name").notNull(),
+  /** What the plan covers, in the team's words; the agent reads its sources for this only. Null = everything. */
+  focus: text("focus"),
+  /** The sources it uses, or null for every source in the project (including ones added later). */
+  sourceIds: jsonb("source_ids").$type<string[] | null>(),
+  position: integer("position").notNull().default(0),
+  createdBy: text("created_by"),
+  createdAt: created(),
+  },
+  (t) => [uniqueIndex("plan_tracks_project_number_idx").on(t.projectId, t.number)],
+);
+
 export const requirements = pgTable(
   "requirements",
   {
     id: id(),
     projectId: uuid("project_id").notNull().references(() => projects.id),
     sourceId: uuid("source_id").references(() => sources.id, { onDelete: "cascade" }),
+    /** The test plan it was extracted for. */
+    trackId: uuid("track_id").references(() => planTracks.id, { onDelete: "cascade" }),
     key: text("key").notNull(), // REQ-01
     title: text("title").notNull().default(""),
     text: text("text").notNull(),
@@ -162,7 +194,8 @@ export const requirements = pgTable(
     ...reviewed(),
     createdAt: created(),
   },
-  (t) => [uniqueIndex("requirements_project_key_idx").on(t.projectId, t.key)],
+  // Keys are numbered per test plan (REQ-01 in TP1 and in TP2).
+  (t) => [uniqueIndex("requirements_track_key_idx").on(t.trackId, t.key)],
 );
 
 export type PlanRisk = { area: string; risk: "high" | "medium" | "low"; why: string; priority: "P0" | "P1" | "P2" | "P3" };
@@ -178,6 +211,8 @@ export type PlanBody = { summary?: string; scope: string[]; outOfScope: string[]
 export const testPlans = pgTable("test_plans", {
   id: id(),
   projectId: uuid("project_id").notNull().references(() => projects.id),
+  /** The test plan this is a version of. */
+  trackId: uuid("track_id").references(() => planTracks.id, { onDelete: "cascade" }),
   /** The plan task that drafted it (its run holds tokens and cost). */
   taskId: uuid("task_id").references(() => tasks.id),
   name: text("name").notNull(),
@@ -261,10 +296,12 @@ export const clientQuestions = pgTable("client_questions", {
   id: id(),
   projectId: uuid("project_id").notNull().references(() => projects.id),
   sourceId: uuid("source_id").references(() => sources.id, { onDelete: "cascade" }),
+  /** The test plan whose extraction raised it. */
+  trackId: uuid("track_id").references(() => planTracks.id, { onDelete: "cascade" }),
   question: text("question").notNull(),
   why: text("why").notNull().default(""),
   sourceChunkIds: jsonb("source_chunk_ids").$type<string[]>().notNull().default([]),
-  status: text("status").notNull().default("open"), // open | answered | dismissed
+  status: text("status").notNull().default("open"), // open | answered | dismissed | withdrawn (its source was replaced or removed)
   answer: text("answer"),
   createdAt: created(),
 });

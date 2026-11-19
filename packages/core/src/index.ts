@@ -118,7 +118,7 @@ export const SOURCE_TYPES = ["pdf", "docx", "md", "transcript", "loom", "conflue
 export type SourceType = (typeof SOURCE_TYPES)[number];
 
 /** Where an ingested source is in its life. */
-export const SOURCE_STATUSES = ["queued", "ingesting", "ready", "needs-transcript", "failed", "superseded"] as const;
+export const SOURCE_STATUSES = ["queued", "ingesting", "ready", "needs-transcript", "failed", "superseded", "removed"] as const;
 export type SourceStatus = (typeof SOURCE_STATUSES)[number];
 
 /** Review states shared by requirements, plans and test cases. */
@@ -161,12 +161,15 @@ export function loomLinkAt(link: string, sec: number | undefined): string {
 
 /** Longest note the team can attach to a source, and longest standing instructions for a project (characters). */
 export const AGENT_NOTE_MAX = 1000;
+/** Longest test plan name, and longest focus the team can give a test plan. */
+export const PLAN_NAME_MAX = 80;
+export const PLAN_FOCUS_MAX = 1000;
 export const AGENT_INSTRUCTIONS_MAX = 4000;
 
 /** Most pages read when a Confluence page is added with its child pages. */
 export const CONFLUENCE_MAX_PAGES = 50;
 
-export type ConfluencePageRef = { origin: string; pageId: string } | { origin: string; tiny: string };
+export type ConfluencePageRef = { origin: string; pageId: string } | { origin: string; folderId: string } | { origin: string; tiny: string };
 
 /**
  * The page a Confluence Cloud link points at, or null if it isn't a page link. Accepts
@@ -184,6 +187,9 @@ export function confluencePageRef(link: string): ConfluencePageRef | null {
   const path = u.pathname.replace(/\/+$/, "");
   const page = path.match(/^\/wiki\/spaces\/[^/]+\/pages\/(?:edit-v2\/|edit\/)?(\d+)(?:\/|$)/);
   if (page) return { origin: u.origin, pageId: page[1]! };
+  // Folders (Confluence Cloud's page-tree folders): every page inside is read.
+  const folder = path.match(/^\/wiki\/spaces\/[^/]+\/folder\/(\d+)(?:\/|$)/);
+  if (folder) return { origin: u.origin, folderId: folder[1]! };
   if (/^\/wiki\/pages\/(?:viewpage|editpage)\.action$/.test(path)) {
     const id = u.searchParams.get("pageId");
     return id && /^\d+$/.test(id) ? { origin: u.origin, pageId: id } : null;
@@ -233,8 +239,24 @@ export const PlanJob = z.object({
   taskId: z.string().uuid(),
   runId: z.string().uuid(),
   projectId: z.string().uuid(),
+  /** The test plan to draft a new version of; the project's first plan when missing (jobs queued before plans had names). */
+  trackId: z.string().uuid().optional(),
 });
 export type PlanJob = z.infer<typeof PlanJob>;
+
+/**
+ * Job: start a new test plan. Its sources (already read) are extracted again for its focus, giving the plan its own
+ * requirements and client questions, then a plan run drafts its first version.
+ */
+export const TrackJob = z.object({
+  taskId: z.string().uuid(),
+  runId: z.string().uuid(),
+  projectId: z.string().uuid(),
+  trackId: z.string().uuid(),
+  /** The plan's focus or sources changed: drop its requirements and questions first, so it's read afresh from 01. */
+  reset: z.boolean().optional(),
+});
+export type TrackJob = z.infer<typeof TrackJob>;
 
 /** The monorepo root (folder holding pnpm-workspace.yaml), or the current folder outside the repo. */
 export function repoRoot(): string {

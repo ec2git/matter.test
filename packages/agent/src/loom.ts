@@ -34,9 +34,11 @@ export async function loomOembed(link: string, f: Fetch = fetch): Promise<Partia
   }
 }
 
+// Ask only for the two links we use: Loom has removed fields from this type before (`id`, Nov 2026), and asking
+// for a field that no longer exists fails the whole query.
 const TRANSCRIPT_QUERY = `query FetchVideoTranscript($videoId: ID!, $password: String) {
   fetchVideoTranscript(videoId: $videoId, password: $password) {
-    ... on VideoTranscriptDetails { id video_id source_url captions_source_url }
+    ... on VideoTranscriptDetails { source_url captions_source_url }
     ... on GenericError { message }
   }
 }`;
@@ -56,9 +58,10 @@ export async function fetchLoomTranscript(link: string, f: Fetch = fetch): Promi
       body: JSON.stringify({ operationName: "FetchVideoTranscript", variables: { videoId: id, password: null }, query: TRANSCRIPT_QUERY }),
       signal: AbortSignal.timeout(15_000),
     });
+    const j = (await res.json().catch(() => ({}))) as { data?: { fetchVideoTranscript?: typeof details }; errors?: { message: string }[] };
+    // Loom answers a query it can't run with HTTP 400 and the reason in `errors`; keep the reason for the Sources list.
+    if (j.errors?.length) throw new Error(`HTTP ${res.status}: ${j.errors[0]!.message}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const j = (await res.json()) as { data?: { fetchVideoTranscript?: typeof details }; errors?: { message: string }[] };
-    if (j.errors?.length) throw new Error(j.errors[0]!.message);
     details = j.data?.fetchVideoTranscript ?? undefined;
   } catch (e) {
     throw new LoomTranscriptUnavailable(`Loom didn't return a transcript (${(e as Error).message}).`);

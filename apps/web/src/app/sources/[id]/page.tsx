@@ -2,12 +2,12 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { asc, eq, inArray } from "drizzle-orm";
 import { loomLinkAt } from "@mattertest/core";
-import { requirements, sourceChunks, sources } from "@mattertest/db";
+import { planTracks, requirements, sourceChunks, sources } from "@mattertest/db";
 import { Shell } from "@/components/Shell";
 import { sourceTitle } from "@/lib/assets";
 import { latestSiteCheck, projectWithClient } from "@/lib/queries";
 import { db } from "@/lib/server";
-import { SOURCE_STATUS_LABEL, SOURCE_TYPE_LABEL, clock, dateTime, plural } from "@/lib/format";
+import { SOURCE_STATUS_LABEL, SOURCE_TYPE_LABEL, clock, dateTime, planKey, plural } from "@/lib/format";
 
 export const dynamic = "force-dynamic";
 
@@ -23,7 +23,7 @@ export default async function SourceView({ params, searchParams }: { params: Pro
   const { project, client } = row;
   const [chunks, reqs, latest] = await Promise.all([
     db.select().from(sourceChunks).where(eq(sourceChunks.sourceId, id)).orderBy(asc(sourceChunks.position)),
-    db.select({ id: requirements.id, key: requirements.key, title: requirements.title, chunks: requirements.sourceChunkIds, state: requirements.reviewState }).from(requirements).where(inArray(requirements.sourceId, [id])),
+    db.select({ id: requirements.id, key: requirements.key, plan: planTracks.number, title: requirements.title, chunks: requirements.sourceChunkIds, state: requirements.reviewState }).from(requirements).leftJoin(planTracks, eq(planTracks.id, requirements.trackId)).where(inArray(requirements.sourceId, [id])),
     latestSiteCheck(source.projectId),
   ]);
   const highlight = new Set((hl ?? "").split(",").filter(Boolean));
@@ -68,7 +68,7 @@ export default async function SourceView({ params, searchParams }: { params: Pro
                   <span className="small muted">
                     Used by{" "}
                     {used.map((r, i) => (
-                      <span key={r.id}>{i > 0 && ", "}<Link href={`/projects/${project.id}/review?item=req:${r.id}`}>{r.key}</Link></span>
+                      <span key={r.id}>{i > 0 && ", "}<Link href={`/projects/${project.id}/review?item=req:${r.id}`}>{r.plan ? planKey(r.plan, r.key) : r.key}</Link></span>
                     ))}
                   </span>
                 )}

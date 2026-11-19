@@ -17,7 +17,7 @@ function NoteField({ id }: { id: string }) {
       <summary className="small">Add a note for the agent</summary>
       <div className="field" style={{ marginTop: 6 }}>
         <label htmlFor={id} className="sr-only">Note for the agent about this source</label>
-        <textarea id={id} name="note" className="input" maxLength={1000} rows={3} placeholder="e.g. This is the v1 brief; only section 4 (Shipping) still applies." />
+        <textarea id={id} name="note" className="input" maxLength={1000} rows={3} placeholder="e.g. Consolidated from the v1.2 brief, the 12 Nov Loom and the Confluence spec; the Loom wins on shipping." />
       </div>
     </details>
   );
@@ -73,6 +73,9 @@ export function AddSource({ projectId }: { projectId: string }) {
 
   return (
     <div className="dropzone">
+      <div className="consolidate-tip" role="note">
+        <strong>Consolidate first.</strong> Gather the client&apos;s requirements from briefs, calls and tickets into one document (or one Confluence page), settle duplicates and conflicts, then add that. Claude reads each source on its own, so it won&apos;t merge or reconcile several. Use the note for the agent to say what it was consolidated from.
+      </div>
       <form ref={fileForm} action={upload} className="stack">
         <input type="hidden" name="projectId" value={projectId} />
         <div className="field">
@@ -98,16 +101,16 @@ export function AddSource({ projectId }: { projectId: string }) {
       <form ref={confForm} action={addConf} className="stack" style={{ paddingTop: 10, borderTop: "1px solid var(--border)" }}>
         <input type="hidden" name="projectId" value={projectId} />
         <div className="field">
-          <label htmlFor="confluence-link">Or a Confluence page</label>
-          <span className="hint small">Page link. It&apos;s read with the team&apos;s Confluence account, so that account needs access to the space.</span>
+          <label htmlFor="confluence-link">Or a Confluence page or folder</label>
+          <span className="hint small">Page or folder link. A folder reads every page in it. It&apos;s read with the team&apos;s Confluence account, so that account needs access to the space.</span>
           <input id="confluence-link" name="link" type="url" className="input" required placeholder="https://yoursite.atlassian.net/wiki/spaces/…/pages/…" />
         </div>
         <label className="row small" style={{ gap: 8, alignItems: "center", cursor: "pointer" }}>
           <input type="checkbox" name="includeChildren" style={{ width: 18, height: 18, margin: 0 }} />
-          Include child pages (up to 50, each read as its own source)
+          Include child pages (up to 50, each read as its own source; always on for folders)
         </label>
         <NoteField id="note-confluence" />
-        <button type="submit" className="btn btn-outline btn-sm" disabled={reading} style={{ alignSelf: "flex-start" }}>{reading ? "Adding…" : "Add page"}</button>
+        <button type="submit" className="btn btn-outline btn-sm" disabled={reading} style={{ alignSelf: "flex-start" }}>{reading ? "Adding…" : "Add"}</button>
         <Message state={conf} />
       </form>
     </div>

@@ -15,6 +15,8 @@ questions: things the team would otherwise have to guess — rules that are miss
 
 Matter Design's QA guidelines may follow in <qa_guidelines>: the house rules for every project (priorities, wording, test data, what to always consider or leave out). Apply them to how you write and prioritise; where they tell you to always consider an area the source touches but doesn't specify, ask a question rather than invent a rule. The team may also add <team_instructions> for the project and a <source_note> for this source; these override the guidelines where they conflict. Follow them for what to focus on or skip, how to word and group things, terminology and priorities. They never replace the sources: every requirement still comes from the passages and cites them, and if an instruction asks for something the sources don't support, raise it as a question instead of inventing it.
 
+A project can have several test plans, each on its own topic, and the source may cover more than one. When a <plan_focus> is given, you are extracting for that plan only: return the requirements and questions within its focus and leave the rest of the source out, even when it is clearly testable. Where a source_note names a different topic from the plan_focus, the plan_focus decides what's in scope; follow the note's other guidance.
+
 Transcripts are spoken and informal: ignore greetings, filler and screen-sharing chatter, and treat "we'd like", "it should", "make sure" as requirements. When the speaker is unsure or thinking aloud, raise a question rather than a requirement.
 
 Write in plain Australian English. Return nothing beyond the requested JSON.`;
@@ -39,6 +41,10 @@ Priority follows what a failure would cost the business: negative scenarios for 
 testCases (one or more per scenario): a tester who has never seen the project must be able to run each one from what you write. Preconditions say what must be true first; testData names concrete values (codes, products, accounts, addresses) — invent plausible ones where the source doesn't give them and say so in testData. Steps are single actions a person takes in the browser, each with the result they should see; expected results must be observable and specific (exact messages and totals when the source gives them). Cite in chunkIds the passages that the steps and expected results come from, using only ids that appear in the input. Mark automationCandidate for stable, high-value paths worth running on every deploy.
 
 Matter Design's QA guidelines may follow in <qa_guidelines>: the house rules for every project (priority definitions, how to write steps and expected results, test data conventions, areas to always consider, what to leave out). Follow them in every plan and test case. The team may also add <team_instructions> for the project and notes about individual sources; these override the guidelines where they conflict. Follow them for focus, scope, priorities, test data conventions, wording and which cases to mark for automation. They never replace the sources: steps and expected results still come from the passages and cite them; when an instruction asks for coverage the requirements don't support, leave it out rather than inventing behaviour.
+
+A project can have several test plans, each on its own topic. When a <plan_focus> is given, this plan covers that topic only: keep the scope, stories and scenarios to it, and list related areas outside it as out of scope.
+
+When the input lists work the team has already approved, keep it as it is and plan around it: don't redraft or repeat those stories, scenarios or test cases. New scenarios may belong to an approved story by its ref.
 
 Don't test what the sources don't ask for, and don't repeat the same check across cases. Write in plain Australian English. Return nothing beyond the requested JSON.`;
 
@@ -70,6 +76,13 @@ function teamInstructions(text: string | null | undefined): string[] {
   return t ? ["<team_instructions>", esc(t), "</team_instructions>", ""] : [];
 }
 
+/** The topic of the test plan being drafted, when the project has several. */
+function planFocus(name: string | null | undefined, focus: string | null | undefined): string[] {
+  const f = focus?.trim();
+  if (!f) return [];
+  return [`<plan_focus${name?.trim() ? ` plan="${attr(name.trim())}"` : ""}>`, esc(f), "</plan_focus>", ""];
+}
+
 export function extractUser(input: {
   project: string;
   client: string;
@@ -79,6 +92,8 @@ export function extractUser(input: {
   passages: Passage[];
   instructions?: string | null;
   sourceNote?: string | null;
+  planName?: string | null;
+  focus?: string | null;
 }): string {
   const note = input.sourceNote?.trim();
   return [
@@ -86,18 +101,26 @@ export function extractUser(input: {
     `Source: "${input.sourceName}", a ${KIND[input.sourceType] ?? input.sourceType}, in ${input.passages.length} passages.`,
     "",
     ...teamInstructions(input.instructions),
+    ...planFocus(input.planName, input.focus),
     ...(note ? ["<source_note>", esc(note), "</source_note>", ""] : []),
     "<source>",
     ...input.passages.map(formatPassage),
     "</source>",
     "",
-    "Extract the requirements and questions for the client from this source.",
+    input.focus?.trim() ? "Extract the requirements and questions for the client from this source that fall within the plan focus." : "Extract the requirements and questions for the client from this source.",
   ].join("\n");
 }
 
 export type PlanRequirement = { key: string; title: string; text: string; area: string | null; acceptanceCriteria: string[]; passageRefs: string[] };
 
+/** Work the team already approved, which a new plan keeps as it is. Story refs are A1, A2… */
+export type KeptWork = {
+  stories: { ref: string; key: string; title: string; actor: string; want: string; soThat: string; requirementKeys: string[]; critical: boolean }[];
+  scenarios: { key: string | null; title: string; kind: string; priority: string; requirementKeys: string[]; storyRef: string | null; cases: { key: string; title: string }[] }[];
+};
+
 export function planUser(input: {
+  kept?: KeptWork | null;
   project: string;
   client: string;
   platform: string;
@@ -107,6 +130,8 @@ export function planUser(input: {
   openQuestions: string[];
   instructions?: string | null;
   sourceNotes?: { source: string; note: string }[];
+  planName?: string | null;
+  focus?: string | null;
 }): string {
   const notes = (input.sourceNotes ?? []).filter((n) => n.note.trim());
   const reqs = input.requirements.map((r) =>
@@ -121,11 +146,13 @@ export function planUser(input: {
     `Project: ${input.project} for ${input.client} (platform: ${input.platform}${input.siteUrl ? `, site ${input.siteUrl}` : ""}).`,
     "",
     ...teamInstructions(input.instructions),
+    ...planFocus(input.planName, input.focus),
     ...(notes.length ? ["Notes the team added about sources:", ...notes.map((n) => esc(`- ${n.source}: ${n.note.trim()}`)), ""] : []),
     `<requirements count="${input.requirements.length}">`,
     ...reqs,
     "</requirements>",
     "",
+    ...keptLines(input.kept),
     "<passages>",
     ...input.passages.map(formatPassage),
     "</passages>",
@@ -135,6 +162,26 @@ export function planUser(input: {
     "",
     "Draft the test plan, scenarios and test cases.",
   ].join("\n");
+}
+
+function keptLines(kept: KeptWork | null | undefined): string[] {
+  if (!kept || (!kept.stories.length && !kept.scenarios.length)) return [];
+  return [
+    "Already approved by the team. Keep these exactly as they are: don't redraft, reword or repeat them, and plan the rest around them.",
+    ...(kept.stories.length
+      ? [
+          "Approved user stories (use their refs as storyRef for new scenarios that belong to them; don't list them again in stories):",
+          ...kept.stories.map((st) => esc(`- ${st.ref} (${st.key}${st.critical ? ", critical" : ""}): ${st.title}. As a ${st.actor}, I want to ${st.want}, so that ${st.soThat}. Covers ${st.requirementKeys.join(", ")}.`)),
+        ]
+      : []),
+    ...(kept.scenarios.length
+      ? [
+          "Approved scenarios and test cases (they already count towards coverage):",
+          ...kept.scenarios.map((sc) => esc(`- ${sc.key ? `${sc.key} ` : ""}[${sc.kind}, ${sc.priority}] ${sc.title} (${sc.requirementKeys.join(", ")})${sc.storyRef ? ` under ${sc.storyRef}` : ""}: ${sc.cases.map((c) => `${c.key} ${c.title}`).join("; ")}`)),
+        ]
+      : []),
+    "",
+  ];
 }
 
 /** The gap-filling pass: same context as the plan, plus what's already drafted and exactly which scenarios are missing. */

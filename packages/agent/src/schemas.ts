@@ -187,9 +187,10 @@ export type PlanReport = { droppedScenarios: number; droppedTestCases: number; u
  * Keep scenarios that cover at least one known requirement, and test cases with at least one complete step.
  * Each case is checked against core's `TestCaseInput`, the shape the review screen and later the sanity runner use.
  */
-export function resolvePlan(raw: PlanDraft, requirementKeys: Set<string>, chunkRefs: ChunkRefs) {
-  const stories = resolveStories(raw.stories ?? [], requirementKeys);
-  const { scenarios, report } = resolveScenarios(raw.scenarios, requirementKeys, chunkRefs, new Set(stories.map((s) => s.ref)));
+export function resolvePlan(raw: PlanDraft, requirementKeys: Set<string>, chunkRefs: ChunkRefs, keptStoryRefs: Set<string> = new Set()) {
+  // A drafted story can't reuse an approved story's ref.
+  const stories = resolveStories(raw.stories ?? [], requirementKeys).filter((s) => !keptStoryRefs.has(s.ref));
+  const { scenarios, report } = resolveScenarios(raw.scenarios, requirementKeys, chunkRefs, new Set([...stories.map((s) => s.ref), ...keptStoryRefs]));
   const plan = {
     name: clean(raw.name) || "Test plan",
     summary: clean(raw.summary),

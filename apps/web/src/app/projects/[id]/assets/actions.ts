@@ -3,11 +3,12 @@
 import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import { and, desc, eq, inArray, ne } from "drizzle-orm";
+import { and, desc, eq, inArray, ne, sql } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
+import { redirect } from "next/navigation";
 import { z } from "zod";
-import { AGENT_INSTRUCTIONS_MAX, AGENT_NOTE_MAX, MAX_UPLOAD_BYTES, UPLOAD_TYPES, artefactPath, confluencePageRef, confluencePageUrl, loomVideoId, type SourceType } from "@mattertest/core";
-import { clientQuestions, projects, requirements, runs, scenarios, sources, tasks, testCases, testPlans, userStories } from "@mattertest/db";
+import { AGENT_INSTRUCTIONS_MAX, AGENT_NOTE_MAX, MAX_UPLOAD_BYTES, PLAN_FOCUS_MAX, PLAN_NAME_MAX, UPLOAD_TYPES, artefactPath, confluencePageRef, confluencePageUrl, loomVideoId, type SourceType } from "@mattertest/core";
+import { clientQuestions, planTracks, projects, requirements, runs, scenarios, sources, tasks, testCases, testPlans, userStories } from "@mattertest/db";
 import { requireUser } from "@/lib/auth";
 import { agentQueue, db } from "@/lib/server";
 
@@ -102,9 +103,10 @@ export async function uploadSource(_prev: FormState, formData: FormData): Promis
   const hash = createHash("sha256").update(data).digest("hex");
 
   const [same] = await db
-    .select({ id: sources.id, name: sources.name })
+    .select({ id: sources.id, name: sources.name, status: sources.status })
     .from(sources)
     .where(and(eq(sources.projectId, projectId), eq(sources.contentHash, hash), ne(sources.status, "failed")));
+  if (same?.status === "removed") return { error: `This file was removed from the project (${same.name}). Restore it under Removed sources instead.` };
   if (same) return { error: `This file is already a source (${same.name}).` };
 
   const fileUri = await saveFile(projectId, hash, up.file.name, data);
@@ -176,8 +178,9 @@ export async function addConfluencePage(_prev: FormState, formData: FormData): P
   if (!(await projectExists(projectId))) return { error: "Project not found." };
   const link = String(formData.get("link") ?? "").trim();
   const ref = confluencePageRef(link);
-  if (!ref) return { error: "Paste a Confluence page link, like https://yoursite.atlassian.net/wiki/spaces/DOCS/pages/123456/Page+title" };
-  const includeChildren = formData.get("includeChildren") === "on";
+  if (!ref) return { error: "Paste a Confluence page or folder link, like https://yoursite.atlassian.net/wiki/spaces/DOCS/pages/123456/Page+title or …/spaces/DOCS/folder/123456" };
+  const folder = "folderId" in ref;
+  const includeChildren = folder || formData.get("includeChildren") === "on";
   const given = readNote(formData);
   if ("error" in given) return given;
   if ("pageId" in ref) {
@@ -188,13 +191,13 @@ export async function addConfluencePage(_prev: FormState, formData: FormData): P
     if (same && !includeChildren) return { error: "This page is already a source. Use “Check Confluence for updates” to pick up edits." };
   }
   try {
-    await queueConfluence(projectId, includeChildren ? "Add Confluence page and child pages" : "Add Confluence page", { link, includeChildren, ...given }, user.email);
+    await queueConfluence(projectId, folder ? "Add Confluence folder" : includeChildren ? "Add Confluence page and child pages" : "Add Confluence page", { link, includeChildren, ...given }, user.email);
   } catch (e) {
     revalidate(projectId);
     return { error: (e as Error).message };
   }
   revalidate(projectId);
-  return { ok: includeChildren ? "Reading the page and its child pages from Confluence now." : "Reading the page from Confluence now." };
+  return { ok: folder ? "Reading the pages in the folder from Confluence now." : includeChildren ? "Reading the page and its child pages from Confluence now." : "Reading the page from Confluence now." };
 }
 
 /** Re-check every Confluence page in the project; changed and new child pages are read again and a new plan is drafted. */
@@ -259,14 +262,167 @@ export async function retrySource(formData: FormData) {
   revalidate(source.projectId);
 }
 
-/** Draft a new plan version from the current requirements (e.g. after rejecting some). */
+/**
+ * Take a source out of the project: its requirements stop feeding the plan and its open client questions are
+ * withdrawn. Nothing is deleted, so it can be restored. The plan is flagged for re-drafting on Test assets.
+ */
+export async function removeSource(formData: FormData) {
+  const user = await requireUser();
+  const sourceId = Uuid.parse(formData.get("sourceId"));
+  const [source] = await db.select().from(sources).where(eq(sources.id, sourceId));
+  if (!source || source.status === "removed" || source.status === "superseded" || source.status === "queued" || source.status === "ingesting") return;
+  await db
+    .update(sources)
+    .set({ status: "removed", meta: { ...source.meta, removedFrom: source.status, removedBy: user.email } })
+    .where(eq(sources.id, source.id));
+  await db.update(clientQuestions).set({ status: "withdrawn" }).where(and(eq(clientQuestions.sourceId, source.id), eq(clientQuestions.status, "open")));
+  revalidate(source.projectId);
+}
+
+/** Put a removed source back as it was: its requirements feed the plan again and its withdrawn questions reopen. */
+export async function restoreSource(formData: FormData) {
+  await requireUser();
+  const sourceId = Uuid.parse(formData.get("sourceId"));
+  const [source] = await db.select().from(sources).where(eq(sources.id, sourceId));
+  if (!source || source.status !== "removed") return;
+  const { removedFrom, removedBy: _by, ...meta } = source.meta;
+  await db.update(sources).set({ status: removedFrom && removedFrom !== "removed" ? removedFrom : "ready", meta }).where(eq(sources.id, source.id));
+  await db.update(clientQuestions).set({ status: "open" }).where(and(eq(clientQuestions.sourceId, source.id), eq(clientQuestions.status, "withdrawn")));
+  revalidate(source.projectId);
+}
+
+/**
+ * Start a new test plan on its own topic. Its sources (already read) are extracted again with its focus, then its
+ * first version is drafted. The project's other plans aren't touched.
+ */
+export async function createPlan(_prev: FormState, formData: FormData): Promise<FormState> {
+  const user = await requireUser();
+  const projectId = Uuid.parse(formData.get("projectId"));
+  if (!(await projectExists(projectId))) return { error: "Project not found." };
+  const name = String(formData.get("name") ?? "").trim().replace(/\s+/g, " ");
+  const focus = String(formData.get("focus") ?? "").trim();
+  if (!name) return { error: "Give the test plan a name, like “Click and collect”." };
+  if (name.length > PLAN_NAME_MAX) return { error: `Keep the name under ${PLAN_NAME_MAX} characters.` };
+  if (!focus) return { error: "Say what this plan covers, so the agent reads the sources for that topic only." };
+  if (focus.length > PLAN_FOCUS_MAX) return { error: `Keep the focus under ${PLAN_FOCUS_MAX} characters (it's ${focus.length}).` };
+  const existing = await db.select({ name: planTracks.name, position: planTracks.position, number: planTracks.number }).from(planTracks).where(eq(planTracks.projectId, projectId));
+  if (existing.some((t) => t.name.toLowerCase() === name.toLowerCase())) return { error: `There's already a test plan called “${name}”.` };
+
+  const live = await db.select({ id: sources.id }).from(sources).where(and(eq(sources.projectId, projectId), eq(sources.status, "ready")));
+  const picked = formData.getAll("sourceId").map(String).filter((sid) => live.some((x) => x.id === sid));
+  if (!picked.length) return { error: live.length ? "Pick at least one source for this plan." : "Add a source first; a test plan is drafted from the project's sources." };
+  // Every ready source ticked means "all sources", including ones added later.
+  const sourceIds = picked.length === live.length && formData.get("allSources") === "on" ? null : picked;
+
+  const [track] = await db
+    .insert(planTracks)
+    .values({ projectId, number: Math.max(0, ...existing.map((t) => t.number)) + 1, name, focus, sourceIds, position: Math.max(-1, ...existing.map((t) => t.position)) + 1, createdBy: user.email })
+    .returning();
+  const [task] = await db.insert(tasks).values({ projectId, kind: "plan", trigger: "manual", title: `Start test plan: ${name}`, params: { trackId: track!.id, newPlan: true, requestedBy: user.email } }).returning();
+  const [run] = await db.insert(runs).values({ taskId: task!.id }).returning();
+  try {
+    await agentQueue().add("track", { taskId: task!.id, runId: run!.id, projectId, trackId: track!.id });
+  } catch {
+    const error = "Could not reach the job queue (is Redis running?)";
+    await db.update(runs).set({ status: "failed", finishedAt: new Date(), summary: { error } }).where(eq(runs.id, run!.id));
+    await db.update(tasks).set({ status: "failed" }).where(eq(tasks.id, task!.id));
+  }
+  revalidate(projectId);
+  redirect(`/projects/${projectId}/assets?plan=${track!.id}`);
+}
+
+/** True while any agent job for the project is queued or running; plans aren't changed under a running job. */
+async function projectBusy(projectId: string) {
+  const [row] = await db
+    .select({ n: sql<number>`count(*)::int` })
+    .from(runs)
+    .innerJoin(tasks, eq(tasks.id, runs.taskId))
+    .where(and(eq(tasks.projectId, projectId), inArray(runs.status, ["queued", "running"])));
+  return (row?.n ?? 0) > 0;
+}
+
+/**
+ * Edit a test plan's name, focus and sources. A new name is saved as it is. A new focus or a different set of
+ * sources means the plan is read again: its requirements and questions are replaced and a new version is drafted,
+ * so earlier approvals in this plan start over.
+ */
+export async function editPlan(_prev: FormState, formData: FormData): Promise<FormState> {
+  const user = await requireUser();
+  const trackId = Uuid.parse(formData.get("trackId"));
+  const [track] = await db.select().from(planTracks).where(eq(planTracks.id, trackId));
+  if (!track) return { error: "Test plan not found." };
+  const name = String(formData.get("name") ?? "").trim().replace(/\s+/g, " ");
+  const focus = String(formData.get("focus") ?? "").trim();
+  if (!name) return { error: "Give the test plan a name." };
+  if (name.length > PLAN_NAME_MAX) return { error: `Keep the name under ${PLAN_NAME_MAX} characters.` };
+  if (!focus) return { error: "Say what this plan covers, so the agent reads the sources for that topic only." };
+  if (focus.length > PLAN_FOCUS_MAX) return { error: `Keep the focus under ${PLAN_FOCUS_MAX} characters (it's ${focus.length}).` };
+  const [clash] = await db
+    .select({ id: planTracks.id })
+    .from(planTracks)
+    .where(and(eq(planTracks.projectId, track.projectId), ne(planTracks.id, trackId), sql`lower(${planTracks.name}) = ${name.toLowerCase()}`));
+  if (clash) return { error: `There's already a test plan called “${name}”.` };
+
+  const live = await db.select({ id: sources.id }).from(sources).where(and(eq(sources.projectId, track.projectId), eq(sources.status, "ready")));
+  const picked = formData.getAll("sourceId").map(String).filter((sid) => live.some((x) => x.id === sid));
+  if (!picked.length) return { error: "Pick at least one source for this plan." };
+  const sourceIds = picked.length === live.length && formData.get("allSources") === "on" ? null : picked;
+  const sameSources =
+    sourceIds === null ? track.sourceIds === null : track.sourceIds !== null && [...track.sourceIds].filter((sid) => live.some((x) => x.id === sid)).sort().join() === [...sourceIds].sort().join();
+  const reread = focus !== (track.focus ?? "") || !sameSources;
+  if (reread && (await projectBusy(track.projectId))) return { error: "The agent is working on this project. Try again when it finishes." };
+
+  await db.update(planTracks).set({ name, focus, sourceIds }).where(eq(planTracks.id, trackId));
+  if (!reread) {
+    revalidate(track.projectId);
+    return { ok: "Saved." };
+  }
+  const [task] = await db.insert(tasks).values({ projectId: track.projectId, kind: "plan", trigger: "manual", title: `Read again for test plan: ${name}`, params: { trackId, requestedBy: user.email } }).returning();
+  const [run] = await db.insert(runs).values({ taskId: task!.id }).returning();
+  try {
+    await agentQueue().add("track", { taskId: task!.id, runId: run!.id, projectId: track.projectId, trackId, reset: true });
+  } catch {
+    const error = "Could not reach the job queue (is Redis running?)";
+    await db.update(runs).set({ status: "failed", finishedAt: new Date(), summary: { error } }).where(eq(runs.id, run!.id));
+    await db.update(tasks).set({ status: "failed" }).where(eq(tasks.id, task!.id));
+    revalidate(track.projectId);
+    return { error: `Saved, but ${error.toLowerCase()}.` };
+  }
+  revalidate(track.projectId);
+  return { ok: "Saved. The agent is reading the sources again for this plan." };
+}
+
+/** Delete a test plan with everything drafted for it. The project keeps at least one plan. */
+export async function deletePlan(_prev: FormState, formData: FormData): Promise<FormState> {
+  await requireUser();
+  const trackId = Uuid.parse(formData.get("trackId"));
+  const [track] = await db.select().from(planTracks).where(eq(planTracks.id, trackId));
+  if (!track) return { error: "Test plan not found." };
+  if (String(formData.get("confirm") ?? "").trim().toLowerCase() !== track.name.toLowerCase()) return { error: `Type the plan's name, “${track.name}”, to delete it.` };
+  const [others] = await db.select({ n: sql<number>`count(*)::int` }).from(planTracks).where(and(eq(planTracks.projectId, track.projectId), ne(planTracks.id, trackId)));
+  if (!others?.n) return { error: "This is the project's only test plan, so it can't be deleted. Edit it instead." };
+  if (await projectBusy(track.projectId)) return { error: "The agent is working on this project. Try again when it finishes." };
+  // Requirements, questions, versions, stories, scenarios and test cases go with the plan (cascading deletes).
+  try {
+    await db.delete(planTracks).where(eq(planTracks.id, trackId));
+  } catch {
+    return { error: "This plan's test cases have run history, so the plan can't be deleted yet." };
+  }
+  revalidate(track.projectId);
+  redirect(`/projects/${track.projectId}/assets`);
+}
+
+/** Draft a new version of one test plan from its current requirements (e.g. after rejecting some). */
 export async function regeneratePlan(formData: FormData) {
   const user = await requireUser();
   const projectId = Uuid.parse(formData.get("projectId"));
-  const [task] = await db.insert(tasks).values({ projectId, kind: "plan", trigger: "manual", title: "Draft test plan", params: { requestedBy: user.email } }).returning();
+  const trackId = Uuid.parse(formData.get("trackId"));
+  const [track] = await db.select({ name: planTracks.name }).from(planTracks).where(and(eq(planTracks.id, trackId), eq(planTracks.projectId, projectId)));
+  if (!track) return;
+  const [task] = await db.insert(tasks).values({ projectId, kind: "plan", trigger: "manual", title: `Draft test plan: ${track.name}`, params: { trackId, requestedBy: user.email } }).returning();
   const [run] = await db.insert(runs).values({ taskId: task!.id }).returning();
   try {
-    await agentQueue().add("plan", { taskId: task!.id, runId: run!.id, projectId });
+    await agentQueue().add("plan", { taskId: task!.id, runId: run!.id, projectId, trackId });
   } catch {
     await db.update(runs).set({ status: "failed", finishedAt: new Date(), summary: { error: "Could not reach the job queue (is Redis running?)" } }).where(eq(runs.id, run!.id));
     await db.update(tasks).set({ status: "failed" }).where(eq(tasks.id, task!.id));

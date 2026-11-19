@@ -85,9 +85,15 @@ export const SOURCE_STATUS_LABEL: Record<string, string> = {
   "needs-transcript": "Needs a transcript",
   failed: "Failed",
   superseded: "Older version",
+  removed: "Removed",
 };
 
 export const SOURCE_TYPE_LABEL: Record<string, string> = { pdf: "PDF", docx: "Word", md: "Markdown", transcript: "Transcript", loom: "Loom video", confluence: "Confluence page" };
+
+/** A test plan's code: TP01, TP02… */
+export const planCode = (planNumber: number) => `TP${String(planNumber).padStart(2, "0")}`;
+/** An item's ID as shown: its key within the test plan, prefixed with the plan's code (TP01-REQ-01, TP02-TC-004). */
+export const planKey = (planNumber: number, key: string) => `${planCode(planNumber)}-${key}`;
 
 export const KIND_LABEL: Record<string, string> = { happy: "Positive", negative: "Negative", edge: "Edge" };
 

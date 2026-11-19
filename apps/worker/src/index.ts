@@ -2,13 +2,13 @@ import { Queue, Worker } from "bullmq";
 import { Redis } from "ioredis";
 import { eq } from "drizzle-orm";
 import { chromium } from "playwright";
-import { ConfluenceJob, IngestJob, PlanJob, QUEUES, SiteCheckJob } from "@mattertest/core";
+import { ConfluenceJob, IngestJob, PlanJob, QUEUES, SiteCheckJob, TrackJob } from "@mattertest/core";
 import { claudeModel, confluenceConfigFromEnv, embedderFromEnv } from "@mattertest/agent";
 import { runSiteCheck } from "@mattertest/checks";
 import { createDb, runs, tasks } from "@mattertest/db";
 import { dbBaselineStore } from "./baselines";
 import { persistSiteCheck } from "./persist";
-import { runConfluence, runIngest, runPlan, type AgentDeps } from "./agent";
+import { runConfluence, runIngest, runPlan, runTrack, type AgentDeps } from "./agent";
 
 const db = createDb();
 // Workers need maxRetriesPerRequest: null for blocking commands.
@@ -65,6 +65,7 @@ const agentWorker = new Worker(
     if (job.name === "ingest") return runIngest(db, IngestJob.parse(job.data), deps);
     if (job.name === "plan") return runPlan(db, PlanJob.parse(job.data), deps);
     if (job.name === "confluence") return runConfluence(db, ConfluenceJob.parse(job.data), deps);
+    if (job.name === "track") return runTrack(db, TrackJob.parse(job.data), deps);
     throw new Error(`Unknown agent job ${job.name}`);
   },
   { connection, concurrency: 1 },
