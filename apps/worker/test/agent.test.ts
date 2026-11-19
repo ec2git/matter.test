@@ -392,12 +392,17 @@ describe.skipIf(!hasDb)("agent jobs", () => {
       await db.delete(clientQuestions).where(and(eq(clientQuestions.trackId, track!.id), eq(clientQuestions.sourceId, checkout.id)));
       const saved = { ...pages["101"]! };
       pages["101"] = { ...saved, version: 2, html: saved.html + "<p>Express shipping costs $14.95.</p>" };
+      pages["102"]!.version = 2; // "Old notes" changes too, but this plan no longer reads it
       try {
         const planned: PlanJob[] = [];
         const reads: TrackJob[] = [];
         const sync = { ...(await confluenceJob(projectId, { sync: true })), thenTrackId: track!.id };
         await runConfluence(db, sync, { ...confDeps(planned), queueTrack: async (j) => void reads.push(j) });
-        expect((await runOf(sync.runId)).summary).toMatchObject({ changed: 1 });
+        // Only the plan's two pages are checked: the change to "Old notes" is left for a full check.
+        expect((await runOf(sync.runId)).summary).toMatchObject({ pages: 2, changed: 1, unchanged: 1 });
+        expect((await byName("Old notes")).version).toBe(1);
+        const [readStep] = await db.select({ title: tasks.title }).from(tasks).where(eq(tasks.parentTaskId, sync.taskId));
+        expect(readStep!.title).toMatch(/^Read new sources: /);
         expect(planned).toHaveLength(0); // this plan is drafted after its own read, not straight from the check
         expect(reads).toEqual([expect.objectContaining({ trackId: track!.id, refresh: true })]);
 
@@ -414,6 +419,7 @@ describe.skipIf(!hasDb)("agent jobs", () => {
         expect(planned).toEqual([expect.objectContaining({ trackId: track!.id })]);
       } finally {
         pages["101"] = saved;
+        pages["102"]!.version = 1;
       }
     });
 

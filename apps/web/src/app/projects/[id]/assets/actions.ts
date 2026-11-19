@@ -440,7 +440,7 @@ export async function draftAgain(formData: FormData) {
     revalidate(projectId);
     return;
   }
-  const [task] = await db.insert(tasks).values({ projectId, kind: "plan", trigger: "manual", title: `Draft test plan: ${track.name}`, params: { trackId, refresh: true, requestedBy: user.email } }).returning();
+  const [task] = await db.insert(tasks).values({ projectId, kind: "plan", trigger: "manual", title: `Read new sources: ${track.name}`, params: { trackId, refresh: true, requestedBy: user.email } }).returning();
   const [run] = await db.insert(runs).values({ taskId: task!.id }).returning();
   try {
     await agentQueue().add("track", { taskId: task!.id, runId: run!.id, projectId, trackId, refresh: true });

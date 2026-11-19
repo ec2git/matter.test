@@ -188,7 +188,11 @@ export function DraftAgain({ projectId, trackId, label, title, version, requirem
       subtitle={title}
       intro={<>The agent drafts {version ? `version ${version + 1}` : "a new version"} from the sources ticked below. It currently has {requirements === 1 ? "1 requirement" : `${requirements} requirements`}; rejected ones are left out.</>}
       points={[
-        confluence ? `First, Confluence is checked for updates (${confluence === 1 ? "1 page" : `${confluence} pages`} ticked). Unchanged pages are skipped at no cost; a changed page is read again, about $0.15 per page for each plan that uses it.` : null,
+        confluence
+          ? picked.size === sources.length
+            ? "First, every Confluence page in the project is checked for updates, since this plan reads all sources; new pages in its folders are added. Unchanged pages are skipped at no cost; a changed page is read again, about $0.15 per page for each plan that uses it, and those other plans are drafted again too."
+            : `First, the ${confluence === 1 ? "Confluence page" : `${confluence} Confluence pages`} this plan reads ${confluence === 1 ? "is" : "are"} checked for updates; other pages in the project aren't. Unchanged pages are skipped at no cost; a changed page is read again, about $0.15 for each plan that uses it.`
+          : null,
         added ? `${added === 1 ? "1 newly ticked source is" : `${added} newly ticked sources are`} read for this plan, about $0.15 each.` : null,
         dropped ? `Requirements from ${dropped === 1 ? "the source" : `the ${dropped} sources`} you unticked are dropped from this plan, approved ones too.` : null,
         "Approved user stories and test cases are kept as they are. Everything still waiting for review is replaced.",

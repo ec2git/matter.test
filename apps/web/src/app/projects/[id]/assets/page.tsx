@@ -413,7 +413,7 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
                 requirements={liveReqs.length}
                 sourceIds={track.sourceIds}
                 sources={readySources}
-                lastCost={planRuns.find((r) => r.status === "done" && r.costUsd > 0)?.costUsd ?? null}
+                lastCost={planRuns.find((r) => r.title.startsWith("Draft test plan") && r.status === "done" && r.costUsd > 0)?.costUsd ?? null}
                 disabled={busy}
                 className="btn btn-outline btn-sm"
               />
@@ -479,7 +479,7 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
                       requirements={n}
                       sourceIds={t.sourceIds}
                       sources={readySources}
-                      lastCost={runsList.find((r) => r.kind === "plan" && runTrack(r) === t.id && r.status === "done" && r.costUsd > 0)?.costUsd ?? null}
+                      lastCost={runsList.find((r) => r.kind === "plan" && r.title.startsWith("Draft test plan") && runTrack(r) === t.id && r.status === "done" && r.costUsd > 0)?.costUsd ?? null}
                       disabled={busy}
                       className="link-btn small"
                     />

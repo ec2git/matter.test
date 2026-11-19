@@ -349,11 +349,22 @@ export async function runConfluence(db: Db, job: ConfluenceJob, deps: AgentDeps)
 
     type Root = { pageId: string; includeChildren: boolean; folder?: boolean; title?: string };
     let roots: Root[];
+    // "Draft again" on a plan that reads chosen sources checks only that plan's pages, so it doesn't re-read (and pay
+    // for) pages only other plans use. A plan that reads every source gets the full check, which also finds new pages.
+    let only: Set<string> | null = null;
     if (job.sync) {
-      const live = await db
+      let live = await db
         .select()
         .from(sources)
         .where(and(eq(sources.projectId, job.projectId), eq(sources.type, "confluence"), notInArray(sources.status, ["superseded", "removed"])));
+      if (job.thenTrackId) {
+        const [track] = await db.select({ sourceIds: planTracks.sourceIds }).from(planTracks).where(eq(planTracks.id, job.thenTrackId));
+        if (track?.sourceIds) {
+          const ids = track.sourceIds;
+          live = live.filter((s) => ids.includes(s.id));
+          only = new Set(live.flatMap((s) => (s.meta.confluence ? [s.meta.confluence.pageId] : [])));
+        }
+      }
       const byRoot = new Map<string, Root>();
       for (const s of live) {
         const c = s.meta.confluence;
@@ -392,7 +403,7 @@ export async function runConfluence(db: Db, job: ConfluenceJob, deps: AgentDeps)
         continue;
       }
       for (const page of tree.pages) {
-        if (seen.has(page.id)) continue;
+        if (seen.has(page.id) || (only && !only.has(page.id))) continue;
         seen.add(page.id);
         const uri = confluencePageUrl(cfg.origin, page.id);
         const [latest] = await db
@@ -497,7 +508,7 @@ async function draftAfterCheck(db: Db, deps: AgentDeps, job: ConfluenceJob) {
   if (!track) return;
   const [task] = await db
     .insert(tasks)
-    .values({ projectId: job.projectId, kind: "plan", trigger: "manual", title: `Draft test plan: ${track.name}`, params: { trackId: job.thenTrackId, refresh: true, requestedBy: job.requestedBy }, parentTaskId: job.taskId })
+    .values({ projectId: job.projectId, kind: "plan", trigger: "manual", title: `Read new sources: ${track.name}`, params: { trackId: job.thenTrackId, refresh: true, requestedBy: job.requestedBy }, parentTaskId: job.taskId })
     .returning();
   const [run] = await db.insert(runs).values({ taskId: task!.id }).returning();
   await deps.queueTrack({ taskId: task!.id, runId: run!.id, projectId: job.projectId, trackId: job.thenTrackId, refresh: true });
