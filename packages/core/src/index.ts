@@ -24,7 +24,7 @@ export type CheckCategory = (typeof CHECK_CATEGORIES)[number];
 export const SEVERITIES = ["critical", "high", "medium", "low", "info"] as const;
 export type Severity = (typeof SEVERITIES)[number];
 
-export const TASK_KINDS = ["ingest", "plan", "site-check", "sanity", "triage", "report"] as const;
+export const TASK_KINDS = ["ingest", "plan", "site-check", "sanity", "triage", "report", "export"] as const;
 export type TaskKind = (typeof TASK_KINDS)[number];
 
 export const TASK_TRIGGERS = ["manual", "schedule", "webhook", "deploy", "supervisor"] as const;
@@ -111,10 +111,185 @@ export const QUEUES = {
   siteCheck: "site-check",
   sanity: "sanity",
   agent: "agent",
+  jira: "jira",
 } as const;
 
+/** Kinds of client material a project can ingest. */
+export const SOURCE_TYPES = ["pdf", "docx", "md", "transcript", "loom", "confluence"] as const;
+export type SourceType = (typeof SOURCE_TYPES)[number];
+
+/** Where an ingested source is in its life. */
+export const SOURCE_STATUSES = ["queued", "ingesting", "ready", "needs-transcript", "failed", "superseded", "removed"] as const;
+export type SourceStatus = (typeof SOURCE_STATUSES)[number];
+
+/** Review states shared by requirements, plans and test cases. */
+export const REVIEW_STATES = ["needs-review", "approved", "rejected", "superseded"] as const;
+export type ReviewState = (typeof REVIEW_STATES)[number];
+
+/** Files the upload accepts, by extension. `.txt`, `.vtt` and `.srt` are transcripts (e.g. downloaded from Loom). */
+export const UPLOAD_TYPES: Record<string, SourceType> = {
+  pdf: "pdf",
+  docx: "docx",
+  md: "md",
+  markdown: "md",
+  vtt: "transcript",
+  srt: "transcript",
+  txt: "transcript",
+};
+export const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+
+/** The video id of a Loom share or embed link, or null if it isn't one. */
+export function loomVideoId(link: string): string | null {
+  let u: URL;
+  try {
+    u = new URL(link.trim());
+  } catch {
+    return null;
+  }
+  if (u.protocol !== "https:" && u.protocol !== "http:") return null;
+  if (u.hostname !== "loom.com" && u.hostname !== "www.loom.com") return null;
+  const m = u.pathname.match(/^\/(?:share|embed)\/(?:[^/]*-)?([0-9a-f]{32})\/?$/i);
+  return m ? m[1]!.toLowerCase() : null;
+}
+
+/** A Loom share link at a point in the video (`?t=` seconds), for "traced to source" links. */
+export function loomLinkAt(link: string, sec: number | undefined): string {
+  if (sec === undefined || !Number.isFinite(sec)) return link;
+  const u = new URL(link);
+  u.searchParams.set("t", String(Math.max(0, Math.floor(sec))));
+  return u.toString();
+}
+
+/** Longest note the team can attach to a source, and longest standing instructions for a project (characters). */
+export const AGENT_NOTE_MAX = 1000;
+/** Longest test plan name, and longest focus the team can give a test plan. */
+export const PLAN_NAME_MAX = 80;
+export const PLAN_FOCUS_MAX = 1000;
+export const AGENT_INSTRUCTIONS_MAX = 4000;
+
+/** Most pages read when a Confluence page is added with its child pages. */
+export const CONFLUENCE_MAX_PAGES = 50;
+
+export type ConfluencePageRef = { origin: string; pageId: string } | { origin: string; folderId: string } | { origin: string; tiny: string };
+
+/**
+ * The page a Confluence Cloud link points at, or null if it isn't a page link. Accepts
+ * /wiki/spaces/KEY/pages/123/Title, /wiki/spaces/KEY/pages/edit-v2/123, /wiki/pages/viewpage.action?pageId=123
+ * and short links (/wiki/x/AbCd), which the worker resolves.
+ */
+export function confluencePageRef(link: string): ConfluencePageRef | null {
+  let u: URL;
+  try {
+    u = new URL(link.trim());
+  } catch {
+    return null;
+  }
+  if (u.protocol !== "https:" && u.protocol !== "http:") return null;
+  const path = u.pathname.replace(/\/+$/, "");
+  const page = path.match(/^\/wiki\/spaces\/[^/]+\/pages\/(?:edit-v2\/|edit\/)?(\d+)(?:\/|$)/);
+  if (page) return { origin: u.origin, pageId: page[1]! };
+  // Folders (Confluence Cloud's page-tree folders): every page inside is read.
+  const folder = path.match(/^\/wiki\/spaces\/[^/]+\/folder\/(\d+)(?:\/|$)/);
+  if (folder) return { origin: u.origin, folderId: folder[1]! };
+  if (/^\/wiki\/pages\/(?:viewpage|editpage)\.action$/.test(path)) {
+    const id = u.searchParams.get("pageId");
+    return id && /^\d+$/.test(id) ? { origin: u.origin, pageId: id } : null;
+  }
+  const tiny = path.match(/^\/wiki\/x\/([A-Za-z0-9_-]+)$/);
+  if (tiny) return { origin: u.origin, tiny: tiny[1]! };
+  return null;
+}
+
+/** The link stored for a Confluence page: stable across title changes and moves between spaces. */
+export function confluencePageUrl(origin: string, pageId: string): string {
+  return `${origin}/wiki/pages/viewpage.action?pageId=${pageId}`;
+}
+
+/** Where in its source a chunk sits: a page for documents, a time range (seconds) for videos and transcripts. */
+export type ChunkLocator = { page?: number; startSec?: number; endSec?: number };
+
+/** Job: read a source, chunk + embed it, and extract requirements. */
+export const IngestJob = z.object({
+  taskId: z.string().uuid(),
+  runId: z.string().uuid(),
+  sourceId: z.string().uuid(),
+  /** Queue a plan run when ingest succeeds. */
+  thenPlan: z.boolean().default(true),
+});
+export type IngestJob = z.infer<typeof IngestJob>;
+
+/**
+ * Job: read a Confluence page (and optionally its child pages) into sources, or with `sync` re-check every
+ * Confluence page already in the project. New and changed pages are ingested; one plan run follows.
+ */
+export const ConfluenceJob = z.object({
+  taskId: z.string().uuid(),
+  runId: z.string().uuid(),
+  projectId: z.string().uuid(),
+  link: z.string().optional(),
+  includeChildren: z.boolean().default(false),
+  sync: z.boolean().default(false),
+  requestedBy: z.string().optional(),
+  /** The team's note for the agent about the page(s) being added; kept on every page it applies to. */
+  note: z.string().max(AGENT_NOTE_MAX).optional(),
+  /** "Draft again" on this test plan: after the update check, read any of its sources it hasn't read yet and draft it. */
+  thenTrackId: z.string().uuid().optional(),
+});
+export type ConfluenceJob = z.infer<typeof ConfluenceJob>;
+
+/** Job: draft a test plan, scenarios and test cases from a project's requirements. */
+export const PlanJob = z.object({
+  taskId: z.string().uuid(),
+  runId: z.string().uuid(),
+  projectId: z.string().uuid(),
+  /** The test plan to draft a new version of; the project's first plan when missing (jobs queued before plans had names). */
+  trackId: z.string().uuid().optional(),
+});
+export type PlanJob = z.infer<typeof PlanJob>;
+
+/** A Jira project key: capital letters and digits, starting with a letter (DEBRA, NW2). */
+export const JIRA_KEY_RE = /^[A-Z][A-Z0-9_]{0,19}$/;
+
+/**
+ * Job: send a test plan's approved test cases to Jira: an Epic for the plan and a Task per test case. Issues sent
+ * before (to the same Jira project) are updated, not duplicated.
+ */
+export const JiraExportJob = z.object({
+  taskId: z.string().uuid(),
+  runId: z.string().uuid(),
+  projectId: z.string().uuid(),
+  trackId: z.string().uuid(),
+  jiraProject: z.string().regex(JIRA_KEY_RE),
+  requestedBy: z.string().optional(),
+});
+export type JiraExportJob = z.infer<typeof JiraExportJob>;
+
+/** A test plan's code: TP01, TP02… */
+export const planCode = (planNumber: number) => `TP${String(planNumber).padStart(2, "0")}`;
+/** An item's ID as shown: its key within the test plan, prefixed with the plan's code (TP01-REQ-01, TP02-TC-004). */
+export const planKey = (planNumber: number, key: string) => `${planCode(planNumber)}-${key}`;
+
+/**
+ * Job: start a new test plan. Its sources (already read) are extracted again for its focus, giving the plan its own
+ * requirements and client questions, then a plan run drafts its first version.
+ */
+export const TrackJob = z.object({
+  taskId: z.string().uuid(),
+  runId: z.string().uuid(),
+  projectId: z.string().uuid(),
+  trackId: z.string().uuid(),
+  /** The plan's focus or sources changed: drop its requirements and questions first, so it's read afresh from 01. */
+  reset: z.boolean().optional(),
+  /**
+   * "Draft again": read only the sources this plan hasn't read yet, drop what came from sources it no longer reads,
+   * then draft a new version even when nothing new was read.
+   */
+  refresh: z.boolean().optional(),
+});
+export type TrackJob = z.infer<typeof TrackJob>;
+
 /** The monorepo root (folder holding pnpm-workspace.yaml), or the current folder outside the repo. */
-function repoRoot(): string {
+export function repoRoot(): string {
   let dir = process.cwd();
   for (;;) {
     if (existsSync(join(dir, "pnpm-workspace.yaml"))) return dir;

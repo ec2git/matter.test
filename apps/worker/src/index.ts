@@ -1,12 +1,15 @@
-import { Worker } from "bullmq";
+import { Queue, Worker } from "bullmq";
 import { Redis } from "ioredis";
 import { eq } from "drizzle-orm";
 import { chromium } from "playwright";
-import { QUEUES, SiteCheckJob } from "@mattertest/core";
+import { ConfluenceJob, IngestJob, JiraExportJob, PlanJob, QUEUES, SiteCheckJob, TrackJob } from "@mattertest/core";
+import { claudeModel, confluenceConfigFromEnv, embedderFromEnv, jiraConfigFromEnv } from "@mattertest/agent";
 import { runSiteCheck } from "@mattertest/checks";
 import { createDb, runs, tasks } from "@mattertest/db";
 import { dbBaselineStore } from "./baselines";
 import { persistSiteCheck } from "./persist";
+import { runConfluence, runIngest, runPlan, runTrack, type AgentDeps } from "./agent";
+import { runJiraExport } from "./jira";
 
 const db = createDb();
 // Workers need maxRetriesPerRequest: null for blocking commands.
@@ -44,10 +47,62 @@ const siteCheckWorker = new Worker(
 
 siteCheckWorker.on("completed", (job, r) => console.log(`[site-check] ${job.id} done`, r));
 siteCheckWorker.on("failed", (job, err) => console.error(`[site-check] ${job?.id} failed`, err.message));
-console.log("worker ready: listening on", QUEUES.siteCheck);
+/* Agent jobs: ingest a source, then draft a plan. One at a time, so a big document doesn't run two model calls at once. */
+const agentQueue = new Queue(QUEUES.agent, { connection, defaultJobOptions: { attempts: 1, removeOnComplete: 500, removeOnFail: 500 } });
+const embedder = embedderFromEnv();
+const confluence = confluenceConfigFromEnv();
+const agentDeps = (log: (m: string) => void): AgentDeps => ({
+  model: claudeModel(),
+  embedder,
+  confluence,
+  log,
+  queuePlan: async (job) => void (await agentQueue.add("plan", job)),
+  queueTrack: async (job) => void (await agentQueue.add("track", job)),
+});
+
+const agentWorker = new Worker(
+  QUEUES.agent,
+  async (job) => {
+    const deps = agentDeps((m) => void job.log(m));
+    if (job.name === "ingest") return runIngest(db, IngestJob.parse(job.data), deps);
+    if (job.name === "plan") return runPlan(db, PlanJob.parse(job.data), deps);
+    if (job.name === "confluence") return runConfluence(db, ConfluenceJob.parse(job.data), deps);
+    if (job.name === "track") return runTrack(db, TrackJob.parse(job.data), deps);
+    throw new Error(`Unknown agent job ${job.name}`);
+  },
+  { connection, concurrency: 1 },
+);
+agentWorker.on("completed", (job) => console.log(`[agent] ${job.name} ${job.id} done`));
+agentWorker.on("failed", (job, err) => console.error(`[agent] ${job?.name} ${job?.id} failed`, err.message));
+
+/* Jira exports: their own queue, so sending a plan doesn't wait behind a Claude draft. No model calls, no cost. */
+const jira = jiraConfigFromEnv();
+const jiraWorker = new Worker(
+  QUEUES.jira,
+  async (job) => {
+    if (job.name === "export") return runJiraExport(db, JiraExportJob.parse(job.data), { jira, log: (m) => void job.log(m) });
+    throw new Error(`Unknown Jira job ${job.name}`);
+  },
+  { connection, concurrency: 1 },
+);
+jiraWorker.on("completed", (job) => console.log(`[jira] ${job.name} ${job.id} done`));
+jiraWorker.on("failed", (job, err) => console.error(`[jira] ${job?.name} ${job?.id} failed`, err.message));
+if (!process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) console.warn("[agent] ANTHROPIC_API_KEY is not set: ingest and plan jobs will fail until it is.");
+console.log(
+  "worker ready: listening on",
+  QUEUES.siteCheck,
+  "and",
+  QUEUES.agent,
+  embedder ? `(embeddings: ${embedder.name})` : "(embeddings off)",
+  confluence ? `(Confluence: ${confluence.origin})` : "(Confluence not set up)",
+  jira ? `(Jira: ${jira.origin})` : "(Jira not set up)",
+);
 
 const shutdown = async () => {
   await siteCheckWorker.close();
+  await agentWorker.close();
+  await jiraWorker.close();
+  await agentQueue.close();
   await browser.close();
   process.exit(0);
 };
