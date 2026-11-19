@@ -158,7 +158,7 @@ export async function addLoomSource(_prev: FormState, formData: FormData): Promi
 }
 
 /** Queue a Confluence job (add a page, or re-check the project's pages). If the queue is down, the run is marked failed. */
-async function queueConfluence(projectId: string, title: string, data: { link?: string; includeChildren?: boolean; sync?: boolean; note?: string }, requestedBy: string) {
+async function queueConfluence(projectId: string, title: string, data: { link?: string; includeChildren?: boolean; sync?: boolean; note?: string; thenTrackId?: string }, requestedBy: string) {
   const [task] = await db.insert(tasks).values({ projectId, kind: "ingest", trigger: "manual", title, params: { ...data, confluence: true, requestedBy } }).returning();
   const [run] = await db.insert(runs).values({ taskId: task!.id }).returning();
   try {
@@ -412,17 +412,38 @@ export async function deletePlan(_prev: FormState, formData: FormData): Promise<
   redirect(`/projects/${track.projectId}/assets`);
 }
 
-/** Draft a new version of one test plan from its current requirements (e.g. after rejecting some). */
-export async function regeneratePlan(formData: FormData) {
+/**
+ * Draft a new version of one test plan, from the sources the user ticked in the "Draft again" dialog. When the plan
+ * reads any Confluence pages, Confluence is checked for updates first. Then sources the plan hasn't read yet are
+ * read for it, requirements from sources it no longer reads are dropped, and the new version is drafted.
+ */
+export async function draftAgain(formData: FormData) {
   const user = await requireUser();
   const projectId = Uuid.parse(formData.get("projectId"));
   const trackId = Uuid.parse(formData.get("trackId"));
-  const [track] = await db.select({ name: planTracks.name }).from(planTracks).where(and(eq(planTracks.id, trackId), eq(planTracks.projectId, projectId)));
-  if (!track) return;
-  const [task] = await db.insert(tasks).values({ projectId, kind: "plan", trigger: "manual", title: `Draft test plan: ${track.name}`, params: { trackId, requestedBy: user.email } }).returning();
+  const [track] = await db.select().from(planTracks).where(and(eq(planTracks.id, trackId), eq(planTracks.projectId, projectId)));
+  if (!track || (await projectBusy(projectId))) return;
+
+  const live = await db.select({ id: sources.id, type: sources.type }).from(sources).where(and(eq(sources.projectId, projectId), eq(sources.status, "ready")));
+  const picked = formData.getAll("sourceId").map(String).filter((sid) => live.some((x) => x.id === sid));
+  if (!picked.length) return;
+  const sourceIds = picked.length === live.length && formData.get("allSources") === "on" ? null : picked;
+  await db.update(planTracks).set({ sourceIds }).where(eq(planTracks.id, trackId));
+
+  const readsConfluence = live.some((x) => x.type === "confluence" && (sourceIds === null || sourceIds.includes(x.id)));
+  if (readsConfluence) {
+    try {
+      await queueConfluence(projectId, `Check Confluence, then draft: ${track.name}`, { sync: true, thenTrackId: trackId }, user.email);
+    } catch {
+      // The failed run shows in Agent runs.
+    }
+    revalidate(projectId);
+    return;
+  }
+  const [task] = await db.insert(tasks).values({ projectId, kind: "plan", trigger: "manual", title: `Draft test plan: ${track.name}`, params: { trackId, refresh: true, requestedBy: user.email } }).returning();
   const [run] = await db.insert(runs).values({ taskId: task!.id }).returning();
   try {
-    await agentQueue().add("plan", { taskId: task!.id, runId: run!.id, projectId, trackId });
+    await agentQueue().add("track", { taskId: task!.id, runId: run!.id, projectId, trackId, refresh: true });
   } catch {
     await db.update(runs).set({ status: "failed", finishedAt: new Date(), summary: { error: "Could not reach the job queue (is Redis running?)" } }).where(eq(runs.id, run!.id));
     await db.update(tasks).set({ status: "failed" }).where(eq(tasks.id, task!.id));

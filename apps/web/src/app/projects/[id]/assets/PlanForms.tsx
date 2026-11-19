@@ -1,7 +1,8 @@
 "use client";
 
 import { useActionState, useState } from "react";
-import { createPlan, deletePlan, editPlan, type FormState } from "./actions";
+import { ConfirmAction } from "@/components/ConfirmAction";
+import { createPlan, deletePlan, draftAgain, editPlan, type FormState } from "./actions";
 
 function Message({ state }: { state: FormState }) {
   if (state.error) return <p className="error" role="alert">{state.error}</p>;
@@ -9,15 +10,24 @@ function Message({ state }: { state: FormState }) {
   return null;
 }
 
-export type SourceChoice = { id: string; name: string; type: string };
+export type SourceChoice = { id: string; name: string; type: string; confluence?: boolean };
 
 /** Ticks for the sources a plan reads. All ticked means sources added later are read too. */
-function SourcePicker({ sources, picked, setPicked, idPrefix }: { sources: SourceChoice[]; picked: Set<string>; setPicked: (s: Set<string>) => void; idPrefix: string }) {
+function SourcePicker({ sources, picked, setPicked, idPrefix, scroll }: { sources: SourceChoice[]; picked: Set<string>; setPicked: (s: Set<string>) => void; idPrefix: string; scroll?: boolean }) {
   const all = picked.size === sources.length;
   return (
     <fieldset className="field" style={{ border: 0, padding: 0, margin: 0 }}>
-      <legend style={{ fontWeight: 600, fontSize: 14, marginBottom: 6 }}>Sources to read</legend>
+      <legend className="row" style={{ fontWeight: 600, fontSize: 14, marginBottom: 6, gap: 10, width: "100%" }}>
+        Sources to read
+        {sources.length > 3 && (
+          <span className="row small" style={{ gap: 8, fontWeight: 400 }}>
+            <button type="button" className="link-btn small" onClick={() => setPicked(new Set(sources.map((s) => s.id)))} disabled={all}>All</button>
+            <button type="button" className="link-btn small" onClick={() => setPicked(new Set())} disabled={!picked.size}>None</button>
+          </span>
+        )}
+      </legend>
       {!sources.length && <span className="small muted">No sources are ready yet. Add one under Sources first.</span>}
+      <div className="stack" style={{ gap: 6, ...(scroll ? { maxHeight: 220, overflowY: "auto", padding: "8px 10px", border: "1px solid var(--border)", borderRadius: 8 } : {}) }}>
       {sources.map((s) => (
         <label key={s.id} htmlFor={`${idPrefix}-${s.id}`} className="row small" style={{ gap: 8, flexWrap: "nowrap", alignItems: "flex-start" }}>
           <input
@@ -36,6 +46,7 @@ function SourcePicker({ sources, picked, setPicked, idPrefix }: { sources: Sourc
           <span>{s.name} <span className="muted">· {s.type}</span></span>
         </label>
       ))}
+      </div>
       {all && sources.length > 0 && <input type="hidden" name="allSources" value="on" />}
       {sources.length > 0 && <span className="hint small">{all ? "Sources you add later are read for this plan too." : "Only the ticked sources are read for this plan, including their newer versions."}</span>}
     </fieldset>
@@ -134,5 +145,60 @@ export function DeletePlan({ trackId, name, code, only }: { trackId: string; nam
         </form>
       )}
     </details>
+  );
+}
+
+/**
+ * "Draft again" opens a dialog first: drafting runs the agent and costs money, so nothing starts until the user
+ * confirms. The dialog lets them pick the plan's sources; when the plan reads Confluence pages, Confluence is checked
+ * for updates before drafting.
+ */
+export function DraftAgain({ projectId, trackId, label, title, version, requirements, lastCost, disabled, className, sourceIds, sources }: {
+  projectId: string;
+  trackId: string;
+  label: string;
+  /** "TP01 · Booking and Appointments" */
+  title: string;
+  /** The current version, or null when the plan hasn't been drafted. */
+  version: number | null;
+  requirements: number;
+  /** What the last draft of this plan cost, in dollars, if known. */
+  lastCost: number | null;
+  disabled?: boolean;
+  className: string;
+  /** The sources the plan reads now; null means all of them. */
+  sourceIds: string[] | null;
+  /** The project's ready sources to choose from. */
+  sources: SourceChoice[];
+}) {
+  const initial = sourceIds === null ? sources.map((s) => s.id) : sources.filter((s) => sourceIds.includes(s.id)).map((s) => s.id);
+  const [picked, setPicked] = useState<Set<string>>(() => new Set(initial));
+  const added = [...picked].filter((sid) => !initial.includes(sid)).length;
+  const dropped = initial.filter((sid) => !picked.has(sid)).length;
+  const confluence = sources.filter((s) => s.confluence && picked.has(s.id)).length;
+  const cost = lastCost ? `about $${lastCost.toFixed(2)}, like the last draft` : "about $0.40";
+  return (
+    <ConfirmAction
+      action={draftAgain}
+      fields={{ projectId, trackId }}
+      label={label}
+      className={className}
+      disabled={disabled}
+      heading="Draft this test plan again?"
+      subtitle={title}
+      intro={<>The agent drafts {version ? `version ${version + 1}` : "a new version"} from the sources ticked below. It currently has {requirements === 1 ? "1 requirement" : `${requirements} requirements`}; rejected ones are left out.</>}
+      points={[
+        confluence ? `First, Confluence is checked for updates (${confluence === 1 ? "1 page" : `${confluence} pages`} ticked). Unchanged pages are skipped at no cost; a changed page is read again, about $0.15 per page for each plan that uses it.` : null,
+        added ? `${added === 1 ? "1 newly ticked source is" : `${added} newly ticked sources are`} read for this plan, about $0.15 each.` : null,
+        dropped ? `Requirements from ${dropped === 1 ? "the source" : `the ${dropped} sources`} you unticked are dropped from this plan, approved ones too.` : null,
+        "Approved user stories and test cases are kept as they are. Everything still waiting for review is replaced.",
+        version ? `Version ${version} stays in the history but is no longer the current plan.` : null,
+        `Drafting usually takes a few minutes and costs ${cost}.`,
+      ]}
+      confirmLabel={confluence ? "Check and draft" : "Draft again"}
+      confirmDisabled={!picked.size}
+    >
+      <SourcePicker sources={sources} picked={picked} setPicked={setPicked} idPrefix={`draft-src-${trackId}`} scroll />
+    </ConfirmAction>
   );
 }

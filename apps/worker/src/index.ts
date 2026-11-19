@@ -56,6 +56,7 @@ const agentDeps = (log: (m: string) => void): AgentDeps => ({
   confluence,
   log,
   queuePlan: async (job) => void (await agentQueue.add("plan", job)),
+  queueTrack: async (job) => void (await agentQueue.add("track", job)),
 });
 
 const agentWorker = new Worker(

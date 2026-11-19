@@ -231,6 +231,8 @@ export const ConfluenceJob = z.object({
   requestedBy: z.string().optional(),
   /** The team's note for the agent about the page(s) being added; kept on every page it applies to. */
   note: z.string().max(AGENT_NOTE_MAX).optional(),
+  /** "Draft again" on this test plan: after the update check, read any of its sources it hasn't read yet and draft it. */
+  thenTrackId: z.string().uuid().optional(),
 });
 export type ConfluenceJob = z.infer<typeof ConfluenceJob>;
 
@@ -255,6 +257,11 @@ export const TrackJob = z.object({
   trackId: z.string().uuid(),
   /** The plan's focus or sources changed: drop its requirements and questions first, so it's read afresh from 01. */
   reset: z.boolean().optional(),
+  /**
+   * "Draft again": read only the sources this plan hasn't read yet, drop what came from sources it no longer reads,
+   * then draft a new version even when nothing new was read.
+   */
+  refresh: z.boolean().optional(),
 });
 export type TrackJob = z.infer<typeof TrackJob>;
 

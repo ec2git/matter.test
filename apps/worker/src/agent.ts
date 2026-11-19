@@ -54,6 +54,8 @@ export type AgentDeps = {
   confluence?: ConfluenceConfig | null;
   /** Put a plan job on the queue (the worker passes the BullMQ queue; tests run it inline). */
   queuePlan: (job: PlanJob) => Promise<void>;
+  /** Put a test-plan read job on the queue; used when "Draft again" runs after a Confluence check. */
+  queueTrack?: (job: TrackJob) => Promise<void>;
   log?: (msg: string) => void;
 };
 
@@ -476,12 +478,29 @@ export async function runConfluence(db: Db, job: ConfluenceJob, deps: AgentDeps)
       ...(problems.length ? { problems } : {}),
       ...(allFailed ? { error: problems[0] } : {}),
     });
-    if (planTrackIds.length) await queuePlanAfter(db, deps, job.projectId, job.taskId, { confluence: true }, planTrackIds);
+    const others = planTrackIds.filter((t) => t !== job.thenTrackId);
+    if (others.length) await queuePlanAfter(db, deps, job.projectId, job.taskId, { confluence: true }, others);
+    await draftAfterCheck(db, deps, job);
   } catch (e) {
     if (e instanceof AgentError) usage = addUsage(usage, e.usage);
     await finish(db, job.taskId, job.runId, "failed", usage, { ...counts, error: (e as Error).message, ...(problems.length ? { problems } : {}) });
     if (!(e instanceof ConfluenceError)) throw e;
+    // Confluence couldn't be reached: the plan is still drafted, from the pages as they were last read.
+    await draftAfterCheck(db, deps, job);
   }
+}
+
+/** "Draft again" asked for this check first: now read the plan's unread sources and draft it. */
+async function draftAfterCheck(db: Db, deps: AgentDeps, job: ConfluenceJob) {
+  if (!job.thenTrackId || !deps.queueTrack) return;
+  const [track] = await db.select({ name: planTracks.name }).from(planTracks).where(and(eq(planTracks.id, job.thenTrackId), eq(planTracks.projectId, job.projectId)));
+  if (!track) return;
+  const [task] = await db
+    .insert(tasks)
+    .values({ projectId: job.projectId, kind: "plan", trigger: "manual", title: `Draft test plan: ${track.name}`, params: { trackId: job.thenTrackId, refresh: true, requestedBy: job.requestedBy }, parentTaskId: job.taskId })
+    .returning();
+  const [run] = await db.insert(runs).values({ taskId: task!.id }).returning();
+  await deps.queueTrack({ taskId: task!.id, runId: run!.id, projectId: job.projectId, trackId: job.thenTrackId, refresh: true });
 }
 
 /**
@@ -501,17 +520,32 @@ export async function runTrack(db: Db, job: TrackJob, deps: AgentDeps) {
       await db.delete(requirements).where(eq(requirements.trackId, track.id));
       await db.delete(clientQuestions).where(eq(clientQuestions.trackId, track.id));
     }
+    // "Draft again": keep what this plan has already read, drop what came from sources it no longer reads, and read
+    // only the sources it hasn't read yet.
+    let toRead = ready;
+    if (job.refresh) {
+      if (track.sourceIds) {
+        const kept = track.sourceIds.length ? track.sourceIds : ["00000000-0000-0000-0000-000000000000"];
+        await db.delete(requirements).where(and(eq(requirements.trackId, track.id), notInArray(requirements.sourceId, kept)));
+        await db.delete(clientQuestions).where(and(eq(clientQuestions.trackId, track.id), notInArray(clientQuestions.sourceId, kept)));
+      }
+      const readBefore = new Set([
+        ...(await db.selectDistinct({ id: requirements.sourceId }).from(requirements).where(eq(requirements.trackId, track.id))).map((r) => r.id),
+        ...(await db.selectDistinct({ id: clientQuestions.sourceId }).from(clientQuestions).where(eq(clientQuestions.trackId, track.id))).map((r) => r.id),
+      ]);
+      toRead = ready.filter((x) => !readBefore.has(x.id));
+    }
     const ctx = await projectContext(db, job.projectId, deps);
     let reqCount = 0;
     let questionCount = 0;
-    for (const [n, source] of ready.entries()) {
+    for (const [n, source] of toRead.entries()) {
       const rows = await db.select().from(sourceChunks).where(eq(sourceChunks.sourceId, source.id)).orderBy(sourceChunks.position);
       const chunks: StoredChunk[] = rows.map((c) => ({ id: c.id, position: c.position, sectionPath: c.sectionPath, locator: c.locator, text: c.text }));
       if (!chunks.length) continue;
       await progress(db, job.runId, {
-        label: `${ready.length > 1 ? `Source ${n + 1} of ${ready.length}: ` : ""}Claude is reading ${source.meta.title ?? source.name} for ${track.name}`,
+        label: `${toRead.length > 1 ? `Source ${n + 1} of ${toRead.length}: ` : ""}Claude is reading ${source.meta.title ?? source.name} for ${track.name}`,
         done: n,
-        total: ready.length,
+        total: toRead.length,
         stepWeight: 1,
         expectSec: extractSecs(chunks.length),
       });
@@ -521,17 +555,20 @@ export async function runTrack(db: Db, job: TrackJob, deps: AgentDeps) {
       reqCount += out.requirements;
       questionCount += out.questions;
     }
+    // A refresh drafts from everything the plan has, not just what was read now.
+    const [have] = job.refresh ? await db.select({ n: sql<number>`count(*)::int` }).from(requirements).where(eq(requirements.trackId, track.id)) : [{ n: reqCount }];
+    const total = have?.n ?? 0;
     await finish(db, job.taskId, job.runId, "done", usage, {
       plan: track.name,
       ...(track.focus ? { focus: track.focus } : {}),
-      sources: ready.length,
+      sources: toRead.length,
       requirements: reqCount,
       questions: questionCount,
-      ...(reqCount ? {} : { error: "The sources say nothing within this plan's focus." }),
+      ...(total ? {} : { error: "The sources say nothing within this plan's focus." }),
       ...(ctx.instructions?.trim() ? { instructions: ctx.instructions.trim() } : {}),
       ...(ctx.guidelinesVersion ? { guidelinesVersion: ctx.guidelinesVersion } : {}),
     });
-    if (reqCount) await queuePlanAfter(db, deps, job.projectId, job.taskId, { newPlan: true }, [track.id]);
+    if (total) await queuePlanAfter(db, deps, job.projectId, job.taskId, job.refresh ? {} : { newPlan: true }, [track.id]);
   } catch (e) {
     if (e instanceof AgentError) usage = addUsage(usage, e.usage);
     await finish(db, job.taskId, job.runId, "failed", usage, { error: (e as Error).message });

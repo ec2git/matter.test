@@ -6,9 +6,10 @@ import { RunProgress, type Progress } from "@/components/RunProgress";
 import { agentRuns, currentPlan, liveRequirements, passages, projectQuestions, projectSources, projectTracks, removedSources, sourceTitle, type AgentRun, type PlanTree, type SourceRow, type TrackRow } from "@/lib/assets";
 import { latestSiteCheck, projectWithClient } from "@/lib/queries";
 import { KIND_LABEL, REVIEW_LABEL, planCode, planKey, SOURCE_STATUS_LABEL, SOURCE_TYPE_LABEL, clock, duration, plural, timeAgo, usd } from "@/lib/format";
-import { checkConfluence, regeneratePlan, removeSource, restoreSource, retrySource, updateQuestion } from "./actions";
+import { checkConfluence, removeSource, restoreSource, retrySource, updateQuestion } from "./actions";
 import { AddSource, AgentInstructions, AttachTranscript, AutoRefresh } from "./SourceForms";
-import { DeletePlan, EditPlan, NewPlanForm } from "./PlanForms";
+import { DeletePlan, DraftAgain, EditPlan, NewPlanForm } from "./PlanForms";
+import { ConfirmAction } from "@/components/ConfirmAction";
 
 export const dynamic = "force-dynamic";
 
@@ -169,7 +170,7 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
   const lastConfluence = runsList.find((r) => r.confluence);
   const planRuns = runsList.filter((r) => r.kind === "plan" && (!track || runTrack(r) === track.id));
   const lastPlanRun = planRuns[0];
-  const readySources = srcs.filter((s) => s.status === "ready").map((s) => ({ id: s.id, name: sourceTitle(s), type: SOURCE_TYPE_LABEL[s.type] ?? s.type }));
+  const readySources = srcs.filter((s) => s.status === "ready").map((s) => ({ id: s.id, name: sourceTitle(s), type: SOURCE_TYPE_LABEL[s.type] ?? s.type, confluence: s.type === "confluence" }));
   const assetsHref = (t: TrackRow, tabId: Tab = "plan") => `/projects/${id}/assets?plan=${t.id}${tabId === "plan" ? "" : `&tab=${tabId}`}`;
   const inFlight = runsList.filter((r) => r.status === "queued" || r.status === "running");
   const spent = runsList.reduce((n, r) => n + r.costUsd, 0);
@@ -218,6 +219,33 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
     { id: "questions", label: `Questions · ${openQuestions.length}` },
   ];
   const body = tree?.plan.body;
+  /** Reading a source again starts the agent, so the button asks first and says which plans it touches. */
+  const readAgain = (s: SourceRow, label: string, className: string, opts: { disabled?: boolean; title?: string } = {}) => {
+    const using = tracks.filter((t) => t.sourceIds === null || t.sourceIds.includes(s.id));
+    const names = using.map((t) => `${planCode(t.number)} ${t.name}`).join(", ");
+    const estimate = using.length * 0.55;
+    const replaced = s.status === "ready";
+    return (
+      <ConfirmAction
+        action={retrySource}
+        fields={{ sourceId: s.id }}
+        label={label}
+        className={className}
+        disabled={opts.disabled}
+        title={opts.title}
+        heading={s.type === "loom" && s.status === "needs-transcript" ? "Try Loom again?" : replaced ? "Read this source again?" : "Try reading this source again?"}
+        subtitle={sourceTitle(s)}
+        intro={s.type === "loom" && s.status === "needs-transcript" ? "The agent checks whether Loom has a transcript for this video now, and reads it if so." : "The agent reads this source again with the project's current instructions."}
+        points={[
+          using.length ? (using.length === 1 ? `It's read for ${names}, the one test plan that uses it.` : `It's read for the ${using.length} test plans that use it: ${names}.`) : "No test plan uses this source yet, so nothing is drafted.",
+          replaced && using.length ? `Its requirements and client questions in ${using.length === 1 ? "that plan" : "those plans"} are replaced, so approvals on them are lost.` : null,
+          using.length ? `${using.length === 1 ? "That plan is" : "Those plans are"} then drafted again. Approved user stories and test cases are kept.` : null,
+          using.length ? `About $0.15 per plan to read and $0.40 per plan to draft: around $${estimate.toFixed(2)} in all, more for a long source.` : null,
+        ]}
+        confirmLabel={replaced ? "Read again" : "Try again"}
+      />
+    );
+  };
   const sourceRow = (s: SourceRow, inGroup = false) => {
     const canRemove = s.status === "ready" || s.status === "failed" || s.status === "needs-transcript";
     const canReread = s.status === "ready" && !!(s.fileUri || s.uri);
@@ -234,31 +262,18 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
         {s.status === "needs-transcript" && (
           <>
             {s.type === "loom" && s.uri && (
-              <form action={retrySource}>
-                <input type="hidden" name="sourceId" value={s.id} />
-                <button type="submit" className="btn btn-outline btn-sm" disabled={busy}>Try Loom again</button>
-              </form>
+              readAgain(s, "Try Loom again", "btn btn-outline btn-sm", { disabled: busy })
             )}
             <AttachTranscript sourceId={s.id} />
           </>
         )}
         {s.status === "failed" && (
-          <form action={retrySource}>
-            <input type="hidden" name="sourceId" value={s.id} />
-            <button type="submit" className="btn btn-outline btn-sm">Try again</button>
-          </form>
+          readAgain(s, "Try again", "btn btn-outline btn-sm")
         )}
         {(openHref || canRemove || canReread) && (
           <div className="source-actions small">
             {openHref && <a href={openHref} target="_blank" rel="noreferrer">Open in {s.type === "loom" ? "Loom" : "Confluence"}</a>}
-            {canReread && (
-              <form action={retrySource}>
-                <input type="hidden" name="sourceId" value={s.id} />
-                <button type="submit" className="link-btn small" disabled={busy} title="Read this source again with the current instructions, for every test plan that uses it. Its requirements and questions are replaced, so earlier approvals on them are lost.">
-                  Read again
-                </button>
-              </form>
-            )}
+            {canReread && readAgain(s, "Read again", "link-btn small", { disabled: busy })}
             {canRemove && (
               <details className="remove-source">
                 <summary className="small">Remove</summary>
@@ -320,10 +335,23 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
               <div className="stack" style={{ gap: 6, paddingTop: 10, borderTop: "1px solid var(--border)" }}>
                 {lastConfluence && <ConfluenceStatus run={lastConfluence} />}
                 {hasConfluence && (
-                  <form action={checkConfluence}>
-                    <input type="hidden" name="projectId" value={id} />
-                    <button type="submit" className="btn btn-outline btn-sm" disabled={busy}>Check Confluence for updates</button>
-                  </form>
+                  <ConfirmAction
+                    action={checkConfluence}
+                    fields={{ projectId: id }}
+                    label="Check Confluence for updates"
+                    className="btn btn-outline btn-sm"
+                    disabled={busy}
+                    heading="Check Confluence for updates?"
+                    subtitle={`${plural(srcs.filter((x) => x.type === "confluence" && x.status !== "removed").length, "Confluence page")} in this project`}
+                    intro="The agent looks at every Confluence page and folder in this project for changes."
+                    points={[
+                      "Pages that haven't changed are skipped, at no cost.",
+                      "A changed page gets a new version, and new pages in a folder are added. Each is read for every test plan that uses it, about $0.15 per page per plan.",
+                      "Plans whose pages changed are then drafted again, about $0.40 each. Approved user stories and test cases are kept.",
+                      "Requirements from a changed page are replaced, so approvals on them are lost.",
+                    ]}
+                    confirmLabel="Check for updates"
+                  />
                 )}
               </div>
             )}
@@ -376,11 +404,19 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
               </p>
             )}
             {track && reqs.length > 0 && (
-              <form action={regeneratePlan}>
-                <input type="hidden" name="projectId" value={id} />
-                <input type="hidden" name="trackId" value={track.id} />
-                <button type="submit" className="btn btn-outline btn-sm" disabled={busy}>Draft {track.name} again</button>
-              </form>
+              <DraftAgain
+                projectId={id}
+                trackId={track.id}
+                label={`Draft ${track.name} again`}
+                title={`${planCode(track.number)} · ${track.name}`}
+                version={tree?.plan.version ?? null}
+                requirements={liveReqs.length}
+                sourceIds={track.sourceIds}
+                sources={readySources}
+                lastCost={planRuns.find((r) => r.status === "done" && r.costUsd > 0)?.costUsd ?? null}
+                disabled={busy}
+                className="btn btn-outline btn-sm"
+              />
             )}
             {!track && <span className="facts-line">{plural(tracks.length, "test plan")} · {usd(spent)} spent on the agent so far</span>}
             {runsList.length > 0 && (
@@ -434,11 +470,19 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
                 <div className="row" style={{ gap: 10, alignItems: "center" }}>
                   <Link className="btn btn-outline btn-sm" href={assetsHref(t)}>Open</Link>
                   {n > 0 && (
-                    <form action={regeneratePlan}>
-                      <input type="hidden" name="projectId" value={id} />
-                      <input type="hidden" name="trackId" value={t.id} />
-                      <button type="submit" className="link-btn small" disabled={busy}>Draft again</button>
-                    </form>
+                    <DraftAgain
+                      projectId={id}
+                      trackId={t.id}
+                      label="Draft again"
+                      title={`${planCode(t.number)} · ${t.name}`}
+                      version={tr?.plan.version ?? null}
+                      requirements={n}
+                      sourceIds={t.sourceIds}
+                      sources={readySources}
+                      lastCost={runsList.find((r) => r.kind === "plan" && runTrack(r) === t.id && r.status === "done" && r.costUsd > 0)?.costUsd ?? null}
+                      disabled={busy}
+                      className="link-btn small"
+                    />
                   )}
                 </div>
                 <div className="row" style={{ gap: 16, alignItems: "flex-start" }}>

@@ -107,7 +107,7 @@ export async function agentRuns(projectId: string, limit = 10): Promise<AgentRun
       inputTokens: runs.inputTokens,
       outputTokens: runs.outputTokens,
       sourceId: sql<string | null>`${tasks.params}->>'sourceId'`,
-      trackId: sql<string | null>`${tasks.params}->>'trackId'`,
+      trackId: sql<string | null>`coalesce(${tasks.params}->>'trackId', ${tasks.params}->>'thenTrackId')`,
       // Plan runs queued after a Confluence read carry its params too; only the read itself counts.
       confluence: sql<boolean>`${tasks.kind} = 'ingest' and coalesce((${tasks.params}->>'confluence')::boolean, false)`,
     })

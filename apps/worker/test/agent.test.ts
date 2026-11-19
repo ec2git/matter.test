@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { and, asc, eq, inArray } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { confluencePageUrl, type PlanJob } from "@mattertest/core";
+import { confluencePageUrl, type PlanJob, type TrackJob } from "@mattertest/core";
 import { clientQuestions, clients, createDb, planTracks, projects, requirements, runs, scenarios, sourceChunks, sources, tasks, testCases, testPlans, userStories, type Db } from "@mattertest/db";
 import { Extraction, NOT_SET_UP, PlanDraft, type ConfluenceConfig, type Embedder, type StructuredModel } from "@mattertest/agent";
 import { runConfluence, runIngest, runPlan, runTrack, type AgentDeps } from "../src/agent";
@@ -377,6 +377,43 @@ describe.skipIf(!hasDb)("agent jobs", () => {
         pages["102"]!.version = 1;
         children["900"]!.pop();
         delete pages["103"];
+      }
+    });
+
+    it("Draft again checks Confluence first, then reads only the plan's unread sources, drops unticked ones and drafts it", async () => {
+      const projectId = await setup();
+      await runConfluence(db, await confluenceJob(projectId, { link: `${ORIGIN}/wiki/pages/viewpage.action?pageId=100`, includeChildren: true }), confDeps([]));
+      const [track] = await db.select().from(planTracks).where(eq(planTracks.projectId, projectId));
+      const byName = async (name: string) => (await db.select().from(sources).where(and(eq(sources.projectId, projectId), eq(sources.name, name), eq(sources.status, "ready"))))[0]!;
+      const [checkout, shipping, old] = [await byName("Checkout v2"), await byName("Shipping rules"), await byName("Old notes")];
+      // The user unticks "Old notes"; "Checkout v2" stands in for a newly ticked source the plan hasn't read.
+      await db.update(planTracks).set({ sourceIds: [checkout.id, shipping.id] }).where(eq(planTracks.id, track!.id));
+      await db.delete(requirements).where(and(eq(requirements.trackId, track!.id), eq(requirements.sourceId, checkout.id)));
+      await db.delete(clientQuestions).where(and(eq(clientQuestions.trackId, track!.id), eq(clientQuestions.sourceId, checkout.id)));
+      const saved = { ...pages["101"]! };
+      pages["101"] = { ...saved, version: 2, html: saved.html + "<p>Express shipping costs $14.95.</p>" };
+      try {
+        const planned: PlanJob[] = [];
+        const reads: TrackJob[] = [];
+        const sync = { ...(await confluenceJob(projectId, { sync: true })), thenTrackId: track!.id };
+        await runConfluence(db, sync, { ...confDeps(planned), queueTrack: async (j) => void reads.push(j) });
+        expect((await runOf(sync.runId)).summary).toMatchObject({ changed: 1 });
+        expect(planned).toHaveLength(0); // this plan is drafted after its own read, not straight from the check
+        expect(reads).toEqual([expect.objectContaining({ trackId: track!.id, refresh: true })]);
+
+        let calls = 0;
+        const counting: StructuredModel = async (req) => {
+          calls++;
+          return model(req);
+        };
+        await runTrack(db, reads[0]!, { ...confDeps(planned), model: counting });
+        expect(calls).toBe(1); // only "Checkout v2"; the new "Shipping rules" version was read during the check
+        const bySource = await db.selectDistinct({ id: requirements.sourceId }).from(requirements).where(eq(requirements.trackId, track!.id));
+        expect(bySource.map((r) => r.id)).toContain(checkout.id);
+        expect(bySource.map((r) => r.id)).not.toContain(old.id);
+        expect(planned).toEqual([expect.objectContaining({ trackId: track!.id })]);
+      } finally {
+        pages["101"] = saved;
       }
     });
 
