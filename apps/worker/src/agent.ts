@@ -62,7 +62,7 @@ export type AgentDeps = {
 /** Most characters of source text shown to the planner before it falls back to only the cited passages (~150k tokens). */
 const PLAN_CONTEXT_CHARS = 600_000;
 
-async function start(db: Db, taskId: string, runId: string) {
+export async function start(db: Db, taskId: string, runId: string) {
   await db.update(runs).set({ status: "running", startedAt: new Date() }).where(eq(runs.id, runId));
   await db.update(tasks).set({ status: "running" }).where(eq(tasks.id, taskId));
 }
@@ -73,7 +73,7 @@ async function start(db: Db, taskId: string, runId: string) {
  */
 export type RunProgress = { label: string; done: number; total: number; stepWeight: number; stepStartedAt: string; expectSec: number };
 
-async function progress(db: Db, runId: string, p: Omit<RunProgress, "stepStartedAt">) {
+export async function progress(db: Db, runId: string, p: Omit<RunProgress, "stepStartedAt">) {
   const value = JSON.stringify({ progress: { ...p, stepStartedAt: new Date().toISOString() } });
   await db.update(runs).set({ summary: sql`coalesce(${runs.summary}, '{}'::jsonb) || ${value}::jsonb` }).where(eq(runs.id, runId));
 }
@@ -95,7 +95,7 @@ async function planSecs(db: Db, projectId: string): Promise<number> {
 /** A step inside reading one source: its position among the source's steps, and how long it usually takes. */
 type StepReport = (s: { label: string; index: number; count: number; expectSec: number }) => Promise<void>;
 
-async function finish(db: Db, taskId: string, runId: string, status: "done" | "failed" | "needs-review", usage: Usage, summary: Record<string, unknown>) {
+export async function finish(db: Db, taskId: string, runId: string, status: "done" | "failed" | "needs-review", usage: Usage, summary: Record<string, unknown>) {
   await db
     .update(runs)
     .set({

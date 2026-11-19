@@ -24,7 +24,7 @@ export type CheckCategory = (typeof CHECK_CATEGORIES)[number];
 export const SEVERITIES = ["critical", "high", "medium", "low", "info"] as const;
 export type Severity = (typeof SEVERITIES)[number];
 
-export const TASK_KINDS = ["ingest", "plan", "site-check", "sanity", "triage", "report"] as const;
+export const TASK_KINDS = ["ingest", "plan", "site-check", "sanity", "triage", "report", "export"] as const;
 export type TaskKind = (typeof TASK_KINDS)[number];
 
 export const TASK_TRIGGERS = ["manual", "schedule", "webhook", "deploy", "supervisor"] as const;
@@ -111,6 +111,7 @@ export const QUEUES = {
   siteCheck: "site-check",
   sanity: "sanity",
   agent: "agent",
+  jira: "jira",
 } as const;
 
 /** Kinds of client material a project can ingest. */
@@ -245,6 +246,28 @@ export const PlanJob = z.object({
   trackId: z.string().uuid().optional(),
 });
 export type PlanJob = z.infer<typeof PlanJob>;
+
+/** A Jira project key: capital letters and digits, starting with a letter (DEBRA, NW2). */
+export const JIRA_KEY_RE = /^[A-Z][A-Z0-9_]{0,19}$/;
+
+/**
+ * Job: send a test plan's approved test cases to Jira: an Epic for the plan and a Task per test case. Issues sent
+ * before (to the same Jira project) are updated, not duplicated.
+ */
+export const JiraExportJob = z.object({
+  taskId: z.string().uuid(),
+  runId: z.string().uuid(),
+  projectId: z.string().uuid(),
+  trackId: z.string().uuid(),
+  jiraProject: z.string().regex(JIRA_KEY_RE),
+  requestedBy: z.string().optional(),
+});
+export type JiraExportJob = z.infer<typeof JiraExportJob>;
+
+/** A test plan's code: TP01, TP02… */
+export const planCode = (planNumber: number) => `TP${String(planNumber).padStart(2, "0")}`;
+/** An item's ID as shown: its key within the test plan, prefixed with the plan's code (TP01-REQ-01, TP02-TC-004). */
+export const planKey = (planNumber: number, key: string) => `${planCode(planNumber)}-${key}`;
 
 /**
  * Job: start a new test plan. Its sources (already read) are extracted again for its focus, giving the plan its own

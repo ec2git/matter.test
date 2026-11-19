@@ -171,6 +171,9 @@ export const planTracks = pgTable(
   /** The sources it uses, or null for every source in the project (including ones added later). */
   sourceIds: jsonb("source_ids").$type<string[] | null>(),
   position: integer("position").notNull().default(0),
+  /** The Jira Epic the plan was last sent to (DEBRA-581); its project is where the plan's test cases go. */
+  jiraEpicKey: text("jira_epic_key"),
+  jiraSentAt: timestamp("jira_sent_at", { withTimezone: true }),
   createdBy: text("created_by"),
   createdAt: created(),
   },
@@ -287,6 +290,8 @@ export const testCases = pgTable("test_cases", {
   sourceChunkIds: jsonb("source_chunk_ids").$type<string[]>().notNull().default([]),
   /** True once a person changed the agent's draft. */
   edited: boolean("edited").notNull().default(false),
+  /** The Jira Task this case was sent as (DEBRA-582); sending again updates it. */
+  jiraIssueKey: text("jira_issue_key"),
   ...reviewed(),
   createdAt: created(),
 });

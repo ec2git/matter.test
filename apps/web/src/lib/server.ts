@@ -1,10 +1,10 @@
 import "server-only";
 import { Queue } from "bullmq";
 import { Redis } from "ioredis";
-import { QUEUES, type ConfluenceJob, type IngestJob, type PlanJob, type SiteCheckJob, type TrackJob } from "@mattertest/core";
+import { QUEUES, type ConfluenceJob, type IngestJob, type JiraExportJob, type PlanJob, type SiteCheckJob, type TrackJob } from "@mattertest/core";
 import { createDb, type Db } from "@mattertest/db";
 
-const g = globalThis as unknown as { __db?: Db; __siteCheckQueue?: Queue<SiteCheckJob>; __agentQueue?: Queue<IngestJob | PlanJob | ConfluenceJob | TrackJob> };
+const g = globalThis as unknown as { __db?: Db; __siteCheckQueue?: Queue<SiteCheckJob>; __agentQueue?: Queue<IngestJob | PlanJob | ConfluenceJob | TrackJob>; __jiraQueue?: Queue<JiraExportJob> };
 
 /** One pool and one queue per server process (survives dev hot reloads). */
 export const db = (g.__db ??= createDb());
@@ -19,6 +19,14 @@ export function siteCheckQueue() {
 /** Agent jobs: "ingest" (IngestJob), "plan" (PlanJob) and "confluence" (ConfluenceJob). */
 export function agentQueue() {
   return (g.__agentQueue ??= new Queue<IngestJob | PlanJob | ConfluenceJob | TrackJob>(QUEUES.agent, {
+    connection: new Redis(process.env.REDIS_URL ?? "redis://localhost:6379", { maxRetriesPerRequest: 3 }),
+    defaultJobOptions: { attempts: 1, removeOnComplete: 500, removeOnFail: 500 },
+  }));
+}
+
+/** Jira exports ("export", JiraExportJob): their own queue, so sending a plan doesn't wait behind a draft. */
+export function jiraQueue() {
+  return (g.__jiraQueue ??= new Queue<JiraExportJob>(QUEUES.jira, {
     connection: new Redis(process.env.REDIS_URL ?? "redis://localhost:6379", { maxRetriesPerRequest: 3 }),
     defaultJobOptions: { attempts: 1, removeOnComplete: 500, removeOnFail: 500 },
   }));

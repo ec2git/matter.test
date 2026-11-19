@@ -2,7 +2,7 @@
 
 import { useActionState, useState } from "react";
 import { ConfirmAction } from "@/components/ConfirmAction";
-import { createPlan, deletePlan, draftAgain, editPlan, type FormState } from "./actions";
+import { createPlan, deletePlan, draftAgain, editPlan, sendToJira, type FormState } from "./actions";
 
 function Message({ state }: { state: FormState }) {
   if (state.error) return <p className="error" role="alert">{state.error}</p>;
@@ -203,6 +203,74 @@ export function DraftAgain({ projectId, trackId, label, title, version, requirem
       confirmDisabled={!picked.size}
     >
       <SourcePicker sources={sources} picked={picked} setPicked={setPicked} idPrefix={`draft-src-${trackId}`} scroll />
+    </ConfirmAction>
+  );
+}
+
+/**
+ * "Send to Jira": the plan becomes an Epic and each approved test case a Task under it. Asks first, since it writes
+ * to the client's board; the Jira project can be changed in the dialog (try a demo project before the real one).
+ */
+export function SendToJira({ projectId, trackId, code, name, approved, notApproved, sent, defaultProject, epicKey, disabled, className }: {
+  projectId: string;
+  trackId: string;
+  code: string;
+  name: string;
+  approved: number;
+  notApproved: number;
+  /** Approved cases already in Jira (in the project the plan was last sent to). */
+  sent: number;
+  defaultProject: string;
+  epicKey: string | null;
+  disabled?: boolean;
+  className: string;
+}) {
+  const [jiraProject, setJiraProject] = useState(defaultProject);
+  const key = jiraProject.trim().toUpperCase();
+  const valid = /^[A-Z][A-Z0-9_]{0,19}$/.test(key);
+  const sameProject = !!epicKey && epicKey.startsWith(`${key}-`);
+  const updates = sameProject ? sent : 0;
+  const creates = approved - updates;
+  const inputId = `jira-project-${trackId}`;
+  return (
+    <ConfirmAction
+      action={sendToJira}
+      fields={{ projectId, trackId }}
+      label={epicKey ? "Send to Jira again" : "Send to Jira"}
+      className={className}
+      disabled={disabled || !approved}
+      title={approved ? undefined : "Approve test cases in Review first"}
+      heading={`Send ${code} · ${name} to Jira`}
+      subtitle={`${approved} approved ${approved === 1 ? "test case" : "test cases"}`}
+      confirmLabel={valid ? `Send to ${key}` : "Send"}
+      confirmDisabled={!valid}
+      points={[
+        sameProject ? <>The plan&apos;s Epic, <strong>{epicKey}</strong>, is updated.</> : <>An Epic, <strong>{code} {name}: test plan</strong>, is created with the plan&apos;s scope and risk areas.</>,
+        creates > 0 && <>{creates} approved {creates === 1 ? "test case becomes a Task" : "test cases become Tasks"} under it, with steps, expected results, the user story, scenario and requirements, and a link back here.</>,
+        updates > 0 && <>{updates} {updates === 1 ? "Task sent before is" : "Tasks sent before are"} updated. Summary, description and priority are replaced with what&apos;s here; statuses, assignees and comments in Jira are left alone.</>,
+        notApproved > 0 && <>{notApproved} {notApproved === 1 ? "test case isn't" : "test cases aren't"} approved yet and {notApproved === 1 ? "stays" : "stay"} out.</>,
+        epicKey && !sameProject && valid && <>This plan was last sent to {epicKey.split("-")[0]}. Sending to {key} creates a new Epic and Tasks there; the ones in {epicKey.split("-")[0]} stay as they are.</>,
+        <>Labelled <code>mattertest</code> and <code>{code}</code>. No Claude calls, so no cost.</>,
+      ]}
+    >
+      <div className="field">
+        <label htmlFor={inputId}>Jira project key</label>
+        <input
+          id={inputId}
+          name="jiraProject"
+          className="input"
+          value={jiraProject}
+          onChange={(e) => setJiraProject(e.target.value.toUpperCase())}
+          placeholder="DEBRA"
+          maxLength={20}
+          autoComplete="off"
+          spellCheck={false}
+          required
+          aria-invalid={jiraProject !== "" && !valid}
+          style={{ maxWidth: 220, textTransform: "uppercase" }}
+        />
+        <span className="hint small">The letters before the number in an issue key: DEBRA for DEBRA-123.</span>
+      </div>
     </ConfirmAction>
   );
 }

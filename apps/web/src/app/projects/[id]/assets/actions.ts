@@ -7,10 +7,10 @@ import { and, desc, eq, inArray, ne, sql } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { z } from "zod";
-import { AGENT_INSTRUCTIONS_MAX, AGENT_NOTE_MAX, MAX_UPLOAD_BYTES, PLAN_FOCUS_MAX, PLAN_NAME_MAX, UPLOAD_TYPES, artefactPath, confluencePageRef, confluencePageUrl, loomVideoId, type SourceType } from "@mattertest/core";
+import { AGENT_INSTRUCTIONS_MAX, AGENT_NOTE_MAX, JIRA_KEY_RE, MAX_UPLOAD_BYTES, PLAN_FOCUS_MAX, PLAN_NAME_MAX, UPLOAD_TYPES, artefactPath, confluencePageRef, confluencePageUrl, loomVideoId, type SourceType } from "@mattertest/core";
 import { clientQuestions, planTracks, projects, requirements, runs, scenarios, sources, tasks, testCases, testPlans, userStories } from "@mattertest/db";
 import { requireUser } from "@/lib/auth";
-import { agentQueue, db } from "@/lib/server";
+import { agentQueue, db, jiraQueue } from "@/lib/server";
 
 export type FormState = { error?: string; ok?: string };
 
@@ -444,6 +444,36 @@ export async function draftAgain(formData: FormData) {
   const [run] = await db.insert(runs).values({ taskId: task!.id }).returning();
   try {
     await agentQueue().add("track", { taskId: task!.id, runId: run!.id, projectId, trackId, refresh: true });
+  } catch {
+    await db.update(runs).set({ status: "failed", finishedAt: new Date(), summary: { error: "Could not reach the job queue (is Redis running?)" } }).where(eq(runs.id, run!.id));
+    await db.update(tasks).set({ status: "failed" }).where(eq(tasks.id, task!.id));
+  }
+  revalidate(projectId);
+}
+
+/**
+ * Send a test plan's approved test cases to Jira: an Epic for the plan and a Task per case. Sending again updates the
+ * same issues. No model calls, so no cost; the dialog still asks first because it writes to the client's board.
+ */
+export async function sendToJira(formData: FormData) {
+  const user = await requireUser();
+  const projectId = Uuid.parse(formData.get("projectId"));
+  const trackId = Uuid.parse(formData.get("trackId"));
+  const jiraProject = String(formData.get("jiraProject") ?? "").trim().toUpperCase();
+  if (!JIRA_KEY_RE.test(jiraProject)) return;
+  const [track] = await db.select().from(planTracks).where(and(eq(planTracks.id, trackId), eq(planTracks.projectId, projectId)));
+  if (!track) return;
+  // One send at a time per plan, so a double click doesn't make two sets of issues.
+  const [sending] = await db
+    .select({ n: sql<number>`count(*)::int` })
+    .from(runs)
+    .innerJoin(tasks, eq(tasks.id, runs.taskId))
+    .where(and(eq(tasks.projectId, projectId), eq(tasks.kind, "export"), inArray(runs.status, ["queued", "running"]), sql`${tasks.params}->>'trackId' = ${trackId}`));
+  if (sending?.n) return;
+  const [task] = await db.insert(tasks).values({ projectId, kind: "export", trigger: "manual", title: `Send to Jira ${jiraProject}: ${track.name}`, params: { trackId, jiraProject, requestedBy: user.email } }).returning();
+  const [run] = await db.insert(runs).values({ taskId: task!.id }).returning();
+  try {
+    await jiraQueue().add("export", { taskId: task!.id, runId: run!.id, projectId, trackId, jiraProject, requestedBy: user.email });
   } catch {
     await db.update(runs).set({ status: "failed", finishedAt: new Date(), summary: { error: "Could not reach the job queue (is Redis running?)" } }).where(eq(runs.id, run!.id));
     await db.update(tasks).set({ status: "failed" }).where(eq(tasks.id, task!.id));

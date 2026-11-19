@@ -8,7 +8,7 @@ import { latestSiteCheck, projectWithClient } from "@/lib/queries";
 import { KIND_LABEL, REVIEW_LABEL, planCode, planKey, SOURCE_STATUS_LABEL, SOURCE_TYPE_LABEL, clock, duration, plural, timeAgo, usd } from "@/lib/format";
 import { checkConfluence, removeSource, restoreSource, retrySource, updateQuestion } from "./actions";
 import { AddSource, AgentInstructions, AttachTranscript, AutoRefresh } from "./SourceForms";
-import { DeletePlan, DraftAgain, EditPlan, NewPlanForm } from "./PlanForms";
+import { DeletePlan, DraftAgain, EditPlan, NewPlanForm, SendToJira } from "./PlanForms";
 import { ConfirmAction } from "@/components/ConfirmAction";
 import { HistoryList, VersionView } from "./HistoryTab";
 
@@ -174,6 +174,22 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
   const hasConfluence = srcs.some((s) => s.type === "confluence");
   const lastConfluence = runsList.find((r) => r.confluence);
   const planRuns = runsList.filter((r) => r.kind === "plan" && (!track || runTrack(r) === track.id));
+  // Jira: the plan's Epic, which approved cases are in it, and the last send.
+  const exportRuns = runsList.filter((r) => r.kind === "export" && track && runTrack(r) === track.id);
+  const lastExport = exportRuns[0];
+  const jiraOrigin = (() => {
+    const url = runsList.map((r) => r.summary?.epicUrl).find((u): u is string => typeof u === "string");
+    try {
+      return url ? new URL(url).origin : null;
+    } catch {
+      return null;
+    }
+  })();
+  const jiraHref = (key: string) => (jiraOrigin ? `${jiraOrigin}/browse/${key}` : undefined);
+  const epicProject = track?.jiraEpicKey?.split("-")[0] ?? null;
+  const approvedCases = cases.filter((c) => c.reviewState === "approved");
+  const inJira = (c: { jiraIssueKey: string | null }) => !!epicProject && !!c.jiraIssueKey?.startsWith(`${epicProject}-`);
+  const sentCases = approvedCases.filter(inJira).length;
   const lastPlanRun = planRuns[0];
   const readySources = srcs.filter((s) => s.status === "ready").map((s) => ({ id: s.id, name: sourceTitle(s), type: SOURCE_TYPE_LABEL[s.type] ?? s.type, confluence: s.type === "confluence" }));
   const assetsHref = (t: TrackRow, tabId: Tab = "plan") => `/projects/${id}/assets?plan=${t.id}${tabId === "plan" ? "" : `&tab=${tabId}`}`;
@@ -424,6 +440,34 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
                 className="btn btn-outline btn-sm"
               />
             )}
+            {track && tree && (
+              <div className="row" style={{ gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                <SendToJira
+                  projectId={id}
+                  trackId={track.id}
+                  code={planCode(track.number)}
+                  name={track.name}
+                  approved={approvedCases.length}
+                  notApproved={cases.length - approvedCases.length}
+                  sent={sentCases}
+                  defaultProject={epicProject ?? project.jiraKey ?? ""}
+                  epicKey={track.jiraEpicKey}
+                  disabled={exportRuns.some((r) => r.status === "queued" || r.status === "running")}
+                  className="btn btn-outline btn-sm"
+                />
+                {track.jiraEpicKey && (
+                  <span className="small muted">
+                    In Jira as{" "}
+                    {jiraHref(track.jiraEpicKey) ? <a href={jiraHref(track.jiraEpicKey)} target="_blank" rel="noreferrer">{track.jiraEpicKey}</a> : track.jiraEpicKey}
+                    {` · ${sentCases} of ${plural(approvedCases.length, "approved test case")}`}
+                    {track.jiraSentAt ? ` · sent ${timeAgo(track.jiraSentAt)}` : ""}
+                  </span>
+                )}
+                {lastExport && (lastExport.status === "queued" || lastExport.status === "running") && <span className="small muted">Sending to Jira…</span>}
+              </div>
+            )}
+            {lastExport?.status === "failed" && <span className="small" style={{ color: "var(--crit)" }}>The last send to Jira failed: {String(lastExport.summary?.error ?? "unknown error")}</span>}
+            {lastExport?.status === "done" && lastExport.summary?.error ? <span className="small" style={{ color: "var(--crit)" }}>{String(lastExport.summary.error)}</span> : null}
             {!track && <span className="facts-line">{plural(tracks.length, "test plan")} · {usd(spent)} spent on the agent so far</span>}
             {runsList.length > 0 && (
               <details className="small">
@@ -689,7 +733,14 @@ export default async function TestAssets({ params, searchParams }: { params: Pro
                         </td>
                         <td className="num">{c.steps.length}</td>
                         <td>{c.automationCandidate ? "Automation candidate" : "Manual"}</td>
-                        <td><span className={`pill status-${c.reviewState}`}>{REVIEW_LABEL[c.reviewState]}{c.edited ? " · edited" : ""}</span></td>
+                        <td>
+                          <span className={`pill status-${c.reviewState}`}>{REVIEW_LABEL[c.reviewState]}{c.edited ? " · edited" : ""}</span>
+                          {inJira(c) && (
+                            <div className="small" style={{ marginTop: 4 }}>
+                              {jiraHref(c.jiraIssueKey!) ? <a href={jiraHref(c.jiraIssueKey!)} target="_blank" rel="noreferrer">{c.jiraIssueKey}</a> : c.jiraIssueKey}
+                            </div>
+                          )}
+                        </td>
                       </tr>
                       );
                     })}

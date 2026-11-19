@@ -184,7 +184,7 @@ export async function agentRuns(projectId: string, limit = 10): Promise<AgentRun
     })
     .from(runs)
     .innerJoin(tasks, eq(tasks.id, runs.taskId))
-    .where(and(eq(tasks.projectId, projectId), inArray(tasks.kind, ["ingest", "plan"])))
+    .where(and(eq(tasks.projectId, projectId), inArray(tasks.kind, ["ingest", "plan", "export"])))
     .orderBy(desc(runs.createdAt))
     .limit(limit);
   return rows.map((r) => ({ ...r, costUsd: Number(r.costUsd) }));

@@ -2,13 +2,14 @@ import { Queue, Worker } from "bullmq";
 import { Redis } from "ioredis";
 import { eq } from "drizzle-orm";
 import { chromium } from "playwright";
-import { ConfluenceJob, IngestJob, PlanJob, QUEUES, SiteCheckJob, TrackJob } from "@mattertest/core";
-import { claudeModel, confluenceConfigFromEnv, embedderFromEnv } from "@mattertest/agent";
+import { ConfluenceJob, IngestJob, JiraExportJob, PlanJob, QUEUES, SiteCheckJob, TrackJob } from "@mattertest/core";
+import { claudeModel, confluenceConfigFromEnv, embedderFromEnv, jiraConfigFromEnv } from "@mattertest/agent";
 import { runSiteCheck } from "@mattertest/checks";
 import { createDb, runs, tasks } from "@mattertest/db";
 import { dbBaselineStore } from "./baselines";
 import { persistSiteCheck } from "./persist";
 import { runConfluence, runIngest, runPlan, runTrack, type AgentDeps } from "./agent";
+import { runJiraExport } from "./jira";
 
 const db = createDb();
 // Workers need maxRetriesPerRequest: null for blocking commands.
@@ -73,6 +74,19 @@ const agentWorker = new Worker(
 );
 agentWorker.on("completed", (job) => console.log(`[agent] ${job.name} ${job.id} done`));
 agentWorker.on("failed", (job, err) => console.error(`[agent] ${job?.name} ${job?.id} failed`, err.message));
+
+/* Jira exports: their own queue, so sending a plan doesn't wait behind a Claude draft. No model calls, no cost. */
+const jira = jiraConfigFromEnv();
+const jiraWorker = new Worker(
+  QUEUES.jira,
+  async (job) => {
+    if (job.name === "export") return runJiraExport(db, JiraExportJob.parse(job.data), { jira, log: (m) => void job.log(m) });
+    throw new Error(`Unknown Jira job ${job.name}`);
+  },
+  { connection, concurrency: 1 },
+);
+jiraWorker.on("completed", (job) => console.log(`[jira] ${job.name} ${job.id} done`));
+jiraWorker.on("failed", (job, err) => console.error(`[jira] ${job?.name} ${job?.id} failed`, err.message));
 if (!process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) console.warn("[agent] ANTHROPIC_API_KEY is not set: ingest and plan jobs will fail until it is.");
 console.log(
   "worker ready: listening on",
@@ -81,11 +95,13 @@ console.log(
   QUEUES.agent,
   embedder ? `(embeddings: ${embedder.name})` : "(embeddings off)",
   confluence ? `(Confluence: ${confluence.origin})` : "(Confluence not set up)",
+  jira ? `(Jira: ${jira.origin})` : "(Jira not set up)",
 );
 
 const shutdown = async () => {
   await siteCheckWorker.close();
   await agentWorker.close();
+  await jiraWorker.close();
   await agentQueue.close();
   await browser.close();
   process.exit(0);
